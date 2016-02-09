@@ -1,5 +1,7 @@
 
 import htcondor
+import urllib
+import urllib2
 import time
 import json
 
@@ -8,6 +10,7 @@ class FileManager(object):
     """manages the parsing and writing to of all files used by the daemon"""
     FN_CONFIG = "config.json"
     FN_CACHE = "cache.json"
+    FN_OUTBOX = "outbox.json"
 
     @staticmethod
     def load_file(filename):
@@ -33,31 +36,150 @@ class FileManager(object):
 
     @staticmethod
     def write_to_file(obj, filename):
+        """JSON encodes (prettily) and writes the passed object obj to file filename, overwriting contents"""
         f = open(filename, 'w')
         json.dump(obj, f, indent=4)
         f.close()
 
 
+class NetworkManager(object):
+    """performs all networking and abstracts all HTTP use/formatting"""
+
+    # characters which must be escaped in a measurement name
+    MES_ESCAPE_CHARS = [' ', ',']
+
+    @staticmethod
+    def http_connect(url, data = False):
+        """opens url, passing data and returns response. May throw network errors"""
+        if data:
+            req = urllib2.Request(url, data)
+        else:
+            req = urllib2.Request(url)
+        return urllib2.urlopen(req)
+
+    #TODO: fragment data and send in blocks
+
+    @staticmethod
+    def stringify_bin_data(mes, data, t):
+        """
+        formats data tag separated data for the bin at time t into an influxDB HTTP body, using the
+        measurement name mes. data should be in the format [(val, {tag: val,...}), ...].
+        """
+        # no data yields empty string
+        if not data:
+            return ""
+
+        # reformat the measurement name
+        mes = NetworkManager._stringify_measurement(mes, [tag for tag in data[0][1]])
+
+        body = ""
+        for datum in data:
+            tags = ','.join(['%s=%s' % (tag, datum[1][tag]) for tag in datum[1]])
+            body += '%s,%s value=%s %s\n' % (mes, tags, datum[0], t)
+
+        # cut off trailing newline
+        return body[:-1]
+
+    @staticmethod
+    def _stringify_measurement(mes, tags):
+
+        # add suffix
+        if tags:
+            mes += ', tagged by ' + ', '.join(tags)
+
+        # escape illegal chars
+        for char in NetworkManager.MES_ESCAPE_CHARS:
+            mes = mes.replace(char, '\\'+char)
+
+        return mes
+
+
+class Outbox(object):
+    """stores growing data to be pushed to the database"""
+    HTTP_LINES_MAX = 300
+
+    def __init__(self, config):
+        """requires handles to the config (for grabbing db url) and the cache (for existing outbox)"""
+
+        Outbox._spoof()
+
+        # ensure url ends with a forward slash
+        self.url = config.database_url
+        if self.url[-1] != '/':
+            self.url += '/'
+
+        # load outbox from file
+        self.outgoing = FileManager.load_file(FileManager.FN_OUTBOX)  # { db name: "body", ...}
+
+        # push previously failed data, keep failures
+        self.push_outgoing()
+
+    @staticmethod
+    def _spoof():
+        FileManager.write_to_file({}, FileManager.FN_OUTBOX)
+
+    def add(self, db, mes, data, t):
+        """adds the bin data for time t to the outbox, to be pushed to influx under measurement mes and database db"""
+        if db in self.outgoing:
+            self.outgoing[db] += "\n" + NetworkManager.stringify_bin_data(mes, data, t)
+        else:
+            self.outgoing[db] = NetworkManager.stringify_bin_data(mes, data, t)
+
+    def push_outgoing(self):
+        """pushes data to the database, keeps failed pushes"""
+        failed = {}
+        for database in self.outgoing:
+
+            # record for return all failed database pushes
+            try:
+
+                # ensure the database exists
+                query = "CREATE DATABASE IF NOT EXISTS %s" % database
+                NetworkManager.http_connect(self.url + 'query?' + urllib.urlencode({'q': query}))
+
+                # push the data
+                args = urllib.urlencode({'db': database, 'precision': 's'})
+                NetworkManager.http_connect(self.url + 'write?' + args, self.outgoing[database])
+
+            except urllib2.HTTPError as e:
+                print e.read()
+                failed[database] = self.outgoing[database]
+
+        self.outgoing = failed
+
+    def save(self):
+        """save the outbox back to file"""
+        FileManager.write_to_file(self.outgoing, FileManager.FN_OUTBOX)
+
+
 class Config(object):
     """loads and provides access to configurable daemon settings"""
     JSON_FIELD_BIN_DURATION = "BIN DURATION"
+    JSON_FIELD_DATABASE_URL = "DATABASE URL"
     JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
 
     def __init__(self):
 
-        self._spoof()
+        Config._spoof()
 
         j = FileManager.load_file(FileManager.FN_CONFIG)
         self.bin_duration = j[Config.JSON_FIELD_BIN_DURATION]
+        self.database_url = j[Config.JSON_FIELD_DATABASE_URL]
         self.initial_values = j[Config.JSON_FIELD_INIT_VALUES]
 
-    def _spoof(self):
+        # initial_values give a field's initial value in a job,
+        # when that value changes and from when it is (re)initialised
+        # {field: [init val, status or boundary of value change, time of initialisation]
+
+    @staticmethod
+    def _spoof():
         obj = {
             Config.JSON_FIELD_BIN_DURATION: 60,
+            Config.JSON_FIELD_DATABASE_URL: "http://test-003.t2.ucsd.edu:8086",
             Config.JSON_FIELD_INIT_VALUES: {
-                Ad.cpu_time: [0, Ad.first_run_start_time],
-                Ad.wall_time: [0, Ad.first_run_start_time],
-                Ad.num_run_starts: [0, Ad.queue_time]
+                Ad.cpu_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
+                Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
+                Ad.num_run_starts: [0, 'IDLE|RUNNING', Ad.queue_time]
             }
         }
         FileManager.write_to_file(obj, FileManager.FN_CONFIG)
@@ -71,37 +193,76 @@ class Cache(object):
     def __init__(self, config):
         """requires a handle to a Config instance to access a job's initial values"""
 
-        self._spoof()
+        Cache._spoof()
 
         j = FileManager.load_file(FileManager.FN_CACHE)
         self.first_bin_start_time = j[Cache.JSON_FIELD_BIN_TIME]  # time (applies to job_values)
-        self.job_values = j[Cache.JSON_FIELD_JOB_VALUES]          # {id: {field: val, ...}, ... }
-        self.initial_values = config.initial_values               # { field: [val, time field], ... }
+        self.job_values = j[Cache.JSON_FIELD_JOB_VALUES]          # {id: (status, {field: val, ...}), ... }
 
-    def _spoof(self):
+        # { field: [val, state or state boundary, field of init time], ... }
+        self.initial_values = config.initial_values
+
+    @staticmethod
+    def save_running_values(t, jobs, fields):
+        """
+        saves the cache with fields values of active jobs among passed jobs (interpolated to t)
+        from current daemon run, and writes the cache back to file. Currently only correctly handles
+        fields which change over time strictly when the job is in the running state
+        """
+        values = {}
+        for job in jobs:
+
+            # only active jobs which have ever run are to be cached (to ever be looked at again)
+            if job.is_active() and job.num_run_starts > 0:
+                jobvals = {}
+                for field in fields:
+                    jobvals[field] = job.get_running_value_at(field, t)
+                values[job.id] = (job.status, jobvals)
+
         obj = {
-            Cache.JSON_FIELD_BIN_TIME: 1454900000,
-            Cache.JSON_FIELD_JOB_VALUES: {}
+            Cache.JSON_FIELD_BIN_TIME: t,
+            Cache.JSON_FIELD_JOB_VALUES: values
         }
         FileManager.write_to_file(obj, FileManager.FN_CACHE)
 
-    def get_prev_value_and_time(self, job, field):
-        """get the previous field value and its time of a job"""
-        # if in the cache, return the cached value
-        if (job.id in self.job_values) and (field in self.job_values[job.id]):
-            return self.job_values[job.id][field], self.first_bin_start_time
+    @staticmethod
+    def _spoof():
+        obj = {
+            Cache.JSON_FIELD_BIN_TIME: int(time.time()) - 60*60*1,
+            Cache.JSON_FIELD_JOB_VALUES: {}       # {"job#666": (2, {Ad.cpu_time: 10, Ad.wall_time:1}) },
+        }
+        FileManager.write_to_file(obj, FileManager.FN_CACHE)
+
+    def get_prev_running_value_state_and_time(self, job, field):
+        """
+        get the job's field's previous value, the time of that value and the job's status at it.
+        returns (val, time, status)
+        """
+        # if in the cache, return info
+        if (job.id in self.job_values) and (field in self.job_values[job.id][1]):
+            return self.job_values[job.id][1][field], self.job_values[job.id][0], self.first_bin_start_time,
 
         # otherwise we must assume an initial value for the job
-        val, time_field = self.initial_values[field]
-        if time_field in job:
-            return val, job[time_field]
+        val, status_of_change, time_field = self.initial_values[field]
 
-        raise RuntimeError(
-                "get_prev_value_and_time called for a field which wasn't yet cached, so the initial " +
-                "value was used. However, the time classad field associated with the start of this " +
-                "value was not present in the job!\n" +
-                "field: %s, job: %s" % (field, json.dumps(job.ad, indent=4))
-        )
+        # we currently only support calculation of changes in time-changing when running fields
+        if status_of_change != Job.Status.String.RUNNING:
+            raise RuntimeError(
+                "get_prev_value_and_time was called for a field which isn't (approx) linearly increasing when " +
+                "the job is running (this is currnetly the only type of changing field supported). Please seek " +
+                "fields which increase strictly during the time the job is running, such as cpu time and wall time"
+            )
+
+        # some jobs don't have all the time fields (they're too young, for example)
+        if time_field in job.ad:
+            return val, Job.Status.RUNNING, job.ad[time_field]
+
+        error_message = (
+            "get_prev_value_and_time called for a field which wasn't yet cached, so the initial " +
+            "value was used. However, the time classad field associated with the start of this " +
+            "value was not present in the job!\n" +
+            "field: %s, job: %s" % (time_field, json.dumps(dict(job.ad), indent=4)))
+        raise RuntimeError(error_message)
 
 
 class Bin(object):
@@ -111,9 +272,10 @@ class Bin(object):
         self.start_time = t0
         self.end_time = t1
 
-        self.sum_vals = {}           # {tag code: [{tag field: val, ...}, val], ...}
-        self.job_average_vals = {}   # {tag code: [{tag field: val, ...}, val, num jobs], ...}
-        self.time_average_vals = {}  # {tag code: [{tag field: val, ...}, val, total job time], ...}
+        self.sum_vals = {}               # {tag code: [{tag field: val, ...}, val], ...}
+        self.job_average_vals = {}       # {tag code: [{tag field: val, ...}, val, num jobs], ...}
+        self.time_average_vals = {}      # {tag code: [{tag field: val, ...}, val, total job time], ...}
+        self.division_of_sums_vals = {}  # {tag code: [{tag field: val, ...}, numerator, denominator], ...}
 
     def add_to_sum(self, val, tags):
 
@@ -139,7 +301,16 @@ class Bin(object):
             self.time_average_vals[tag_code][1] += val * duration
             self.time_average_vals[tag_code][2] += duration
         else:
-            self.job_average_vals[tag_code] = [tags, val * duration, duration]
+            self.time_average_vals[tag_code] = [tags, val * duration, duration]
+
+    def add_to_division_of_sums(self, num, den, tags):
+
+        tag_code = '|'.join([tags[key] for key in tags])
+        if tag_code in self.division_of_sums_vals:
+            self.division_of_sums_vals[tag_code][1] += num
+            self.division_of_sums_vals[tag_code][2] += den
+        else:
+            self.division_of_sums_vals[tag_code] = [tags, num, den]
 
     def get_sum(self):
 
@@ -164,6 +335,14 @@ class Bin(object):
             item = self.time_average_vals[tag_code]
             averages.append((item[1] / float(item[2]), item[0]))
         return averages
+
+    def get_division_of_sums(self):
+
+        divisions = []
+        for tag_code in self.division_of_sums_vals:
+            item = self.division_of_sums_vals[tag_code]
+            divisions.append((item[1] / float(item[2]), item[0]))
+        return divisions
 
 
 class Ad(object):
@@ -215,7 +394,7 @@ class Ad(object):
     last_evict_time = "LastVacateTime"
 
     # start time (seconds since epoch) of the job's MOST RECENT (may be current) run
-    last_run_start_time = "JobCurrentStartExecutingDate"    # also JobCurrentStartDate (1s dif)
+    last_run_start_time = "JobCurrentStartDate"    # also JobCurrentStartExecutingDate (1s dif)
 
     # time (seconds since epoch) of the job entering its current status
     entered_status_time = "EnteredCurrentStatus"
@@ -245,9 +424,8 @@ class Job(object):
     # required condor classad fields for a job
     req_fields = [
         Ad.id, Ad.submit_site, Ad.job_site, Ad.status, Ad.prev_status, Ad.num_run_starts,
-        Ad.first_run_start_time, Ad.prev_run_start_time, Ad.last_evict_time, Ad.last_evict_time,
+        Ad.first_run_start_time, Ad.prev_run_start_time, Ad.last_evict_time, Ad.last_run_start_time,
         Ad.entered_status_time, Ad.queue_time, Ad.owner, Ad.cpu_time, Ad.wall_time, Ad.server_time,
-        Ad.last_run_start_time
     ]
 
     class Status(object):
@@ -257,6 +435,14 @@ class Job(object):
         COMPLETED = 4
         HELD = 5
         TRANSFERRING_OUTPUT = 6
+
+        class String(object):
+            IDLE = "IDLE"
+            RUNNING = "RUNNING"
+            REMOVED = "REMOVED"
+            COMPLETED = "COMPLETED"
+            HELD = "HELD"
+            TRANSFERRING_OUTPUT = "TRANSFERRING OUTPUT"
 
     # optimises space use of many Job instances
     # __slots__ = ('id', 'owner', 'cpu', 'submit_site', 'job_site')
@@ -271,10 +457,12 @@ class Job(object):
         self.cpu_time = ad[Ad.cpu_time]   # updates every 6 minutes in Condor bindings/binaries
         self.server_time = ad[Ad.server_time] if (Ad.server_time in ad) else int(time.time())
 
-        # wall time doesn't include current running job (add it)
+        # number of job starts and wall time doesn't include current running job (add it)
         if ad[Ad.status] == Job.Status.RUNNING:
             ad[Ad.wall_time] += ad[Ad.server_time] - ad[Ad.last_run_start_time]
+            ad[Ad.num_run_starts] += 1
         self.wall_time = ad[Ad.wall_time]
+        self.num_run_starts = ad[Ad.num_run_starts]
 
         self.id = ad[Ad.id]
         self.submit_site = ad[Ad.submit_site]
@@ -290,7 +478,6 @@ class Job(object):
 
         # idle jobs having never run don't have a previous status
         self.prev_status = ad[Ad.prev_status] if (Ad.prev_status in ad) else None
-        self.num_run_starts = ad[Ad.num_run_starts]
 
         # idle jobs having never run don't have a first run start time, or a previous
         self.first_run_start_time = ad[Ad.first_run_start_time] if (Ad.first_run_start_time in ad) else None
@@ -301,6 +488,10 @@ class Job(object):
         self.last_run_start_time = ad[Ad.last_run_start_time] if (Ad.last_run_start_time in ad) else None
         self.last_evict_time = ad[Ad.last_evict_time] if (Ad.last_evict_time in ad) else None
         self.entered_status_time = ad[Ad.entered_status_time] if (Ad.entered_status_time in ad) else None
+
+    def get_values(self, fields):
+        """returns a dict of field name to the job's current value for all the passed fields"""
+        return dict([(field, job.ad[field]) for field in fields])
 
     def is_idle(self):
         """returns whether the job is currently in the idle state"""
@@ -365,7 +556,7 @@ class Job(object):
             return self.queue_time, self.first_run_start_time
 
         # if the job has run more than once, it was idle from its last eviction to its last run
-        if (self.is_running() and self.was_running()) and (self.num_run_starts > 1):
+        if (self.is_running() or self.was_running()) and (self.num_run_starts > 1):
             return self.last_evict_time, self.last_run_start_time
 
         # otherwise, the job has been removed while idle
@@ -460,81 +651,195 @@ class Job(object):
         dt = min(t1, r1) - max(t0, r0)
         return dt if dt >= 0 else 0
 
-    def get_value_change_over(self, field, t0, t1):
-        """returns the change in a field's value over time span [t0, t1], by linear interpolation"""
-        prev_val, prev_time = self.cache.get_prev_value_and_time(self, field)
-        curr_val, curr_time = self.ad[field], self.server_time
-        return (curr_val - prev_val)/float(curr_time - prev_time) * (t1 - t0)
+    def get_running_value_change_over(self, field, t0, t1):
+        """gets the change (when job's running) in a field's value over time span [t0, t1], by linear interpolation"""
 
-    def get_value_at(self, field, t):
-        """returns a field's value at time t, calculated by linear interpolation from a previous known value"""
-        prev_val, prev_time = self.cache.get_prev_value_and_time(self, field)
-        curr_val, curr_time = self.ad[field], self.server_time
-        return prev_val + (curr_val - prev_val)/float(curr_time - prev_time) * (t - prev_time)
+        # ensure that the job actually runs in the window
+        dt = self.get_time_running_in(t0, t1)
+        if dt == 0:
+            return 0
+
+        # get the previous known value/time from the cache (may be more recent than job's initial value)
+        prev_val, prev_state, prev_time = self.cache.get_prev_running_value_state_and_time(self, field)
+
+        # if the job wasn't RUNNING at cache time, the prev_time should be changed to when it started running again
+        if prev_state != Job.Status.RUNNING:
+            if self.is_running():
+                prev_time = self.last_run_start_time
+            else:
+                # this implies the job wasn't running at prev execution end, started running then ended before now
+                prev_time = self.prev_run_start_time
+
+        # use the currently known value and find when this value was reached (end of job's run status, or now)
+        next_val = self.ad[field]
+        _, next_time = self.get_time_span_running()
+        # if job is still running, the value corresponds to now (server time)
+        if not next_time:
+            next_time = self.server_time
+
+        # must consider for how long the job runs in the given window
+        return (next_val - prev_val)/float(next_time - prev_time) * dt
+
+    def get_running_value_at(self, field, t):
+        """
+        returns a field's (strictly one that increases approx linearly only when a job is running) value at time t,
+        calculated by linear interpolation from a previous known value (or one assumed)
+        """
+        # get the previous known value/state/time from the cache (may be more recent than job's initial value)
+        prev_val, prev_state, prev_time = self.cache.get_prev_running_value_state_and_time(self, field)
+
+        # if the job wasn't running at its cache time, propogate to when it started
+        if prev_state != Job.Status.RUNNING:
+            if self.is_running():
+                prev_time = self.last_run_start_time
+            else:
+                # this implies the job wasn't running at prev execution end, started running then ended before now
+                prev_time = self.prev_run_start_time
+
+        # get the currently known value and find when this value was reached (end of job's run status, or now)
+        next_val = self.ad[field]
+        _, next_time = self.get_time_span_running()
+        # if job is still running, the value corresponds to now (server time)
+        if not next_time:
+            next_time = self.server_time
+
+        # if t is more recent than when this field stopped updating, return its final result
+        if t >= next_time:
+            return next_val
+
+        # otherwise if t occurs before the value started updating again from prev, return the ol dval
+        if t <= prev_time:
+            return prev_val
+
+        # otherwise linear interpolate its value at t
+        return prev_val + (next_val - prev_val)/float(next_time - prev_time) * (t - prev_time)
+
+
+def dummy_job_test():
+    # dummy debug job
+    dummy_job_dict = {
+        Ad.id: "job#123",
+        Ad.submit_site: "UCSD",
+        Ad.job_site: "UCR",
+        Ad.status: 2,
+        Ad.prev_status: 1,
+        Ad.num_run_starts: 1,
+        Ad.first_run_start_time: 10,
+        Ad.prev_run_start_time: None,
+        Ad.last_evict_time: None,
+        Ad.last_run_start_time: 10,
+        Ad.entered_status_time: 10,
+        Ad.queue_time: 5,
+        Ad.owner: "tysonjones",
+        Ad.cpu_time: 4,
+        Ad.wall_time: 0,    # mimic condor bug
+        Ad.server_time: 15
+    }
+
+    another_dummy_job_dict = {
+        Ad.id: "job#666",
+        Ad.submit_site: "UCSD",
+        Ad.job_site: "UCR",
+        Ad.status: 1,              # it re-idled
+        Ad.prev_status: 2,
+        Ad.num_run_starts: 1,
+        Ad.first_run_start_time: -1,
+        Ad.prev_run_start_time: None,
+        Ad.last_evict_time: 10,
+        Ad.last_run_start_time: -1,
+        Ad.entered_status_time: 10,
+        Ad.queue_time: -2,
+        Ad.owner: "tysonjones",
+        Ad.cpu_time: 15,
+        Ad.wall_time: 11,    # left running state, so condor_q fixes wall time
+        Ad.server_time: 15
+    }
+
+    global jobA, jobB
+    jobA = Job(dummy_job_dict, cache)
+    jobB = Job(another_dummy_job_dict, cache)
 
 
 config = Config()
 cache = Cache(config)
-
+outbox = Outbox(config)
 
 schedd = htcondor.Schedd()
-const = 'Owner=?="tysonjones"'
+const = 'true'
 jobs = []
 now = int(time.time())
 for job in schedd.query(const, Job.req_fields):
     jobs.append(Job(job, cache))
     now = job[Ad.server_time]
-for job in schedd.history(const, Job.req_fields, 99999999):
+
+const += ' && EnteredCurrentStatus>%s' % cache.first_bin_start_time
+for job in schedd.history(const, Job.req_fields, 10):
     jobs.append(Job(job, cache))
 
 bin_times = range(cache.first_bin_start_time, now, config.bin_duration)
 bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
 del bin_times
 
-# getting the number of running jobs at the end of the bin, tagged by owner and submit site
-tags = [Ad.owner, Ad.submit_site]
+db = "LightTestDatabase"
+
+'''
+# get the number of running jobs anywhere, tagged by owner (and submit site)
+mes = "num running at bin end"
+tags = [Ad.submit_site, Ad.owner]
 for bin_start_time in bin_start_times:
-    bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-
+    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
-        if job.is_running_during(bin.end_time - 1, bin.end_time):
-            bin.add_to_sum(1, dict([(tag, job.ad[tag]) for tag in tags]))
+        if job.is_running_during(time_bin.end_time - 1, time_bin.end_time):
+            time_bin.add_to_sum(1, job.get_values(tags))
+    results = time_bin.get_sum()
+    outbox.add(db, mes, results, time_bin.start_time)
+'''
 
-    results = bin.get_sum()
-    print "bin %s:" % bin_start_time
-    for result in results:
-        print "%s running jobs submitted by %s at %s" % (result[0], result[1][Ad.owner], result[1][Ad.submit_site])
+# getting the number of running jobs at the end of the bin, tagged by submit site and job site
+mes = "num running at bin end"
+tags = [Ad.submit_site, Ad.job_site]
+for bin_start_time in bin_start_times:
+    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
+    for job in jobs:
+        if job.is_running_during(time_bin.end_time - 1, time_bin.end_time):       # condition of inclusion
+            time_bin.add_to_sum(1, job.get_values(tags))                          # method of inclusion
+    results = time_bin.get_sum()                                                  # (method of inclusion)
+    outbox.add(db, mes, results, time_bin.start_time)
 
-
+# TODO debug
+print results
 
 
 '''
-while True:
-
-    f = open('log.txt', 'a')
-
-
-
+# get the number of idle jobs total in each bin, tagged by owner, submit site and job site
+mes = "num idle total in bin"
+for bin_start_time in bin_start_times:
+    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
+        if job.is_idle_during(time_bin.start_time, time_bin.end_time):
+            time_bin.add_to_sum(1, job.get_values([Ad.submit_site]))
+    outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
 
-        f.write("Job (%s) for %s at %s from %s:" % (job.id, job.owner, job.job_site, job.submit_site))
-
-        cur_val, cur_time = job.cpu_time, int(time.time())
-        f.write("cpu is %d at %d" % (cur_val, cur_time))
-
-        if cache.contains(job, Ad.cpu_time):
-            prev_val, prev_time = cache.get(job, Ad.cpu_time)
-            f.write("cpu was %d at %d" % (prev_val, prev_time))
-
-            dv = cur_val - prev_val
-            dt = cur_time - prev_time
-            dd = dv/float(dt)
-            f.write("change is %s in %s seconds, or %s per second" % (dv, dt, dd))
-
-        cache.add(job, Ad.cpu_time, cur_time)
-        f.write("")
-
-    f.close()
-
-    time.sleep(60*15)
+# get the CPU efficiency of jobs tagged by owner, submit site and job site
+mes = "cpu efficiency"
+for bin_start_time in bin_start_times:
+    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
+    for job in jobs:
+        cpu = job.get_running_value_change_over(Ad.cpu_time, time_bin.start_time, time_bin.end_time)
+        wall = job.get_running_value_change_over(Ad.wall_time, time_bin.start_time, time_bin.end_time)
+        if wall > 0:
+            time_bin.add_to_division_of_sums(100 * cpu, wall, job.get_values(tags))
+    results = time_bin.get_division_of_sums()
+    outbox.add(db, mes, results, bin_start_time)
 '''
+
+# cache fields
+fields_to_cache = [Ad.cpu_time, Ad.wall_time]
+Cache.save_running_values(final_bin_end_time, jobs, fields_to_cache)
+
+# push to influx
+outbox.push_outgoing()
+outbox.save()
+
+
+
