@@ -6,6 +6,9 @@ import time
 import json
 
 
+#TODO: UCI isn't contributing to IDLE! why the fuck not?
+
+
 class FileManager(object):
     """manages the parsing and writing to of all files used by the daemon"""
     FN_CONFIG = "config.json"
@@ -57,8 +60,6 @@ class NetworkManager(object):
             req = urllib2.Request(url)
         return urllib2.urlopen(req)
 
-    #TODO: fragment data and send in blocks
-
     @staticmethod
     def stringify_bin_data(mes, data, t):
         """
@@ -82,7 +83,7 @@ class NetworkManager(object):
 
     @staticmethod
     def _stringify_measurement(mes, tags):
-
+        """reformat a measurement name to abide by influx's requirements (escaping chars) and append tags"""
         # add suffix
         if tags:
             mes += ', tagged by ' + ', '.join(tags)
@@ -90,33 +91,30 @@ class NetworkManager(object):
         # escape illegal chars
         for char in NetworkManager.MES_ESCAPE_CHARS:
             mes = mes.replace(char, '\\'+char)
-
         return mes
 
 
 class Outbox(object):
     """stores growing data to be pushed to the database"""
+    # maximum number of time points to send influx in a single HTTP request
     HTTP_LINES_MAX = 300
 
     def __init__(self, config):
         """requires handles to the config (for grabbing db url) and the cache (for existing outbox)"""
-
-        Outbox._spoof()
 
         # ensure url ends with a forward slash
         self.url = config.database_url
         if self.url[-1] != '/':
             self.url += '/'
 
-        # load outbox from file
-        self.outgoing = FileManager.load_file(FileManager.FN_OUTBOX)  # { db name: "body", ...}
+        # load outbox from file (default to empty if can't read; doesn't delete outbox)
+        try:
+            self.outgoing = FileManager.load_file(FileManager.FN_OUTBOX)  # { db name: "body", ...}
+        except IOError:
+            self.outgoing = {}
 
         # push previously failed data, keep failures
         self.push_outgoing()
-
-    @staticmethod
-    def _spoof():
-        FileManager.write_to_file({}, FileManager.FN_OUTBOX)
 
     def add(self, db, mes, data, t):
         """adds the bin data for time t to the outbox, to be pushed to influx under measurement mes and database db"""
@@ -130,20 +128,28 @@ class Outbox(object):
         failed = {}
         for database in self.outgoing:
 
-            # record for return all failed database pushes
+            # ensure database exists (if it fails, all pushes to this db will fail)
             try:
-
-                # ensure the database exists
                 query = "CREATE DATABASE IF NOT EXISTS %s" % database
                 NetworkManager.http_connect(self.url + 'query?' + urllib.urlencode({'q': query}))
-
-                # push the data
-                args = urllib.urlencode({'db': database, 'precision': 's'})
-                NetworkManager.http_connect(self.url + 'write?' + args, self.outgoing[database])
-
-            except urllib2.HTTPError as e:
-                print e.read()
+            except urllib2.HTTPError:
                 failed[database] = self.outgoing[database]
+                continue
+
+            # database exists; fragment data and push each
+            args = urllib.urlencode({'db': database, 'precision': 's'})
+            lines = self.outgoing[database].split('\n')                         # TODO this is lazy inefficient fragments
+            for i in range(0, len(lines), Outbox.HTTP_LINES_MAX):
+                fragment = '\n'.join(lines[i: i + Outbox.HTTP_LINES_MAX])
+
+                # try to push each fragment, saving failures
+                try:
+                    NetworkManager.http_connect(self.url + 'write?' + args, fragment)
+                except urllib2.HTTPError as e:
+                    if database in failed:
+                        failed[database] += '\n' + fragment
+                    else:
+                        failed[database] = fragment
 
         self.outgoing = failed
 
@@ -160,29 +166,31 @@ class Config(object):
 
     def __init__(self):
 
-        Config._spoof()
-
-        j = FileManager.load_file(FileManager.FN_CONFIG)
-        self.bin_duration = j[Config.JSON_FIELD_BIN_DURATION]
-        self.database_url = j[Config.JSON_FIELD_DATABASE_URL]
-        self.initial_values = j[Config.JSON_FIELD_INIT_VALUES]
-
         # initial_values give a field's initial value in a job,
         # when that value changes and from when it is (re)initialised
         # {field: [init val, status or boundary of value change, time of initialisation]
 
-    @staticmethod
-    def _spoof():
-        obj = {
-            Config.JSON_FIELD_BIN_DURATION: 60,
-            Config.JSON_FIELD_DATABASE_URL: "http://test-003.t2.ucsd.edu:8086",
-            Config.JSON_FIELD_INIT_VALUES: {
+        # try to load the config, creating with defaults otherwise
+        try:
+            j = FileManager.load_file(FileManager.FN_CONFIG)
+            self.bin_duration = j[Config.JSON_FIELD_BIN_DURATION]
+            self.database_url = j[Config.JSON_FIELD_DATABASE_URL]
+            self.initial_values = j[Config.JSON_FIELD_INIT_VALUES]
+
+        except IOError:
+            self.bin_duration = 5*60
+            self.database_url = 'http://localhost:8086'
+            self.initial_values = {
                 Ad.cpu_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
                 Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
                 Ad.num_run_starts: [0, 'IDLE|RUNNING', Ad.queue_time]
             }
-        }
-        FileManager.write_to_file(obj, FileManager.FN_CONFIG)
+            obj = {
+                Config.JSON_FIELD_BIN_DURATION: self.bin_duration,
+                Config.JSON_FIELD_DATABASE_URL: self.database_url,
+                Config.JSON_FIELD_INIT_VALUES: self.initial_values
+            }
+            FileManager.write_to_file(obj, FileManager.FN_CONFIG)
 
 
 class Cache(object):
@@ -193,14 +201,18 @@ class Cache(object):
     def __init__(self, config):
         """requires a handle to a Config instance to access a job's initial values"""
 
-        Cache._spoof()
-
-        j = FileManager.load_file(FileManager.FN_CACHE)
-        self.first_bin_start_time = j[Cache.JSON_FIELD_BIN_TIME]  # time (applies to job_values)
-        self.job_values = j[Cache.JSON_FIELD_JOB_VALUES]          # {id: (status, {field: val, ...}), ... }
-
         # { field: [val, state or state boundary, field of init time], ... }
         self.initial_values = config.initial_values
+
+        # load cache from file, recreating if unable
+        try:
+            j = FileManager.load_file(FileManager.FN_CACHE)
+            self.first_bin_start_time = j[Cache.JSON_FIELD_BIN_TIME]  # time (applies to job_values)
+            self.job_values = j[Cache.JSON_FIELD_JOB_VALUES]          # {id: (status, {field: val, ...}), ... }
+
+        except IOError:
+            self.first_bin_start_time = int(time.time()) - 60*60*24 #2*config.bin_duration
+            self.job_values = {}
 
     @staticmethod
     def save_running_values(t, jobs, fields):
@@ -222,14 +234,6 @@ class Cache(object):
         obj = {
             Cache.JSON_FIELD_BIN_TIME: t,
             Cache.JSON_FIELD_JOB_VALUES: values
-        }
-        FileManager.write_to_file(obj, FileManager.FN_CACHE)
-
-    @staticmethod
-    def _spoof():
-        obj = {
-            Cache.JSON_FIELD_BIN_TIME: int(time.time()) - 60*60*1,
-            Cache.JSON_FIELD_JOB_VALUES: {}       # {"job#666": (2, {Ad.cpu_time: 10, Ad.wall_time:1}) },
         }
         FileManager.write_to_file(obj, FileManager.FN_CACHE)
 
@@ -780,9 +784,12 @@ bin_times = range(cache.first_bin_start_time, now, config.bin_duration)
 bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
 del bin_times
 
+# TODO: debug
+print bin_start_times
+
 db = "LightTestDatabase"
 
-'''
+
 # get the number of running jobs anywhere, tagged by owner (and submit site)
 mes = "num running at bin end"
 tags = [Ad.submit_site, Ad.owner]
@@ -793,7 +800,7 @@ for bin_start_time in bin_start_times:
             time_bin.add_to_sum(1, job.get_values(tags))
     results = time_bin.get_sum()
     outbox.add(db, mes, results, time_bin.start_time)
-'''
+
 
 # getting the number of running jobs at the end of the bin, tagged by submit site and job site
 mes = "num running at bin end"
@@ -806,22 +813,32 @@ for bin_start_time in bin_start_times:
     results = time_bin.get_sum()                                                  # (method of inclusion)
     outbox.add(db, mes, results, time_bin.start_time)
 
-# TODO debug
-print results
 
-
-'''
 # get the number of idle jobs total in each bin, tagged by owner, submit site and job site
 mes = "num idle total in bin"
+tags = [Ad.owner, Ad.submit_site]
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
         if job.is_idle_during(time_bin.start_time, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values([Ad.submit_site]))
+            time_bin.add_to_sum(1, job.get_values(tags))
     outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
+
+
+# get the total CPU
+mes = "total cpu at bin start"
+tags = [Ad.owner, Ad.submit_site, Ad.job_site]
+for bin_start_time in bin_start_times:
+    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
+    for job in jobs:
+        if job.num_run_starts > 0:
+            time_bin.add_to_sum(job.get_running_value_at(Ad.cpu_time, time_bin.start_time), job.get_values(tags))
+    outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
+
 
 # get the CPU efficiency of jobs tagged by owner, submit site and job site
 mes = "cpu efficiency"
+tags = [Ad.owner, Ad.submit_site, Ad.job_site]
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
@@ -831,15 +848,13 @@ for bin_start_time in bin_start_times:
             time_bin.add_to_division_of_sums(100 * cpu, wall, job.get_values(tags))
     results = time_bin.get_division_of_sums()
     outbox.add(db, mes, results, bin_start_time)
-'''
 
-# cache fields
-fields_to_cache = [Ad.cpu_time, Ad.wall_time]
-Cache.save_running_values(final_bin_end_time, jobs, fields_to_cache)
 
 # push to influx
 outbox.push_outgoing()
 outbox.save()
 
-
+# cache fields
+fields_to_cache = [Ad.cpu_time, Ad.wall_time]
+Cache.save_running_values(final_bin_end_time, jobs, fields_to_cache)
 
