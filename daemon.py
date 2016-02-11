@@ -5,8 +5,37 @@ import urllib2
 import time
 import json
 
+DEBUG_PRINT = True
+
+"""
+PITFALLS TO AVOID
+
+- RemoteUserCpu updates only when the Job check-points.
+
+- CurrentTime is bugged
+-> server time is used
+
+- Only jobs from Condor_q have ServerTime
+-> python time substituted
+
+- RemoteWallClockTime is not updated until job stops running (evicted, suspended, terminated or completed)
+-> is updated to include current job runtime
+
+- RemoteWallClockTime includes CumulativeSuspensionTime
+
+- RemoteWallClockTime is not reset when the job is evicted and runs on a new machine (never reset for a job)
+
+- CumulativeSuspensionTime does not include time the job spent idle when evicted or first idle
+
+- NumJobStarts is not updated until running job stops (as for RemoteWallClockTime)
+-> is incremented if job currently running
+
+"""
 
 #TODO: UCI isn't contributing to IDLE! why the fuck not?
+
+
+# TODO: get TotalSuspensions, CumulativeSuspensionTime
 
 
 class FileManager(object):
@@ -55,10 +84,15 @@ class NetworkManager(object):
     def http_connect(url, data = False):
         """opens url, passing data and returns response. May throw network errors"""
         if data:
+            data = data.replace('\n\n', '\n')
+        debug_print("attempting to open %s with data:\n%s" % (url, data))
+        if data:
             req = urllib2.Request(url, data)
         else:
             req = urllib2.Request(url)
-        return urllib2.urlopen(req)
+        resp = urllib2.urlopen(req).read()
+        debug_print("successful! response: %s" % resp)
+        return resp
 
     @staticmethod
     def stringify_bin_data(mes, data, t):
@@ -78,7 +112,7 @@ class NetworkManager(object):
             tags = ','.join(['%s=%s' % (tag, datum[1][tag]) for tag in datum[1]])
             body += '%s,%s value=%s %s\n' % (mes, tags, datum[0], t)
 
-        # cut off trailing newline
+        # cut off trailing newlin
         return body[:-1]
 
     @staticmethod
@@ -118,6 +152,11 @@ class Outbox(object):
 
     def add(self, db, mes, data, t):
         """adds the bin data for time t to the outbox, to be pushed to influx under measurement mes and database db"""
+
+        # empty data ruins our formatting
+        if not data:
+            return
+
         if db in self.outgoing:
             self.outgoing[db] += "\n" + NetworkManager.stringify_bin_data(mes, data, t)
         else:
@@ -394,8 +433,11 @@ class Ad(object):
     # number of times the job has been started
     num_run_starts = "NumJobStarts"
 
-    # last time (seconds since epoch) the job was evicted from running
+    # last time (seconds since epoch) the job was evicted (stopped running, pushed back to global queue)
     last_evict_time = "LastVacateTime"
+
+    # last time (seconds since epoch) the job was suspended (stopped running, still waits at mchine)
+    last_suspend_time = "LastSuspensionTime"
 
     # start time (seconds since epoch) of the job's MOST RECENT (may be current) run
     last_run_start_time = "JobCurrentStartDate"    # also JobCurrentStartExecutingDate (1s dif)
@@ -719,6 +761,11 @@ class Job(object):
         return prev_val + (next_val - prev_val)/float(next_time - prev_time) * (t - prev_time)
 
 
+def debug_print(msg):
+    if DEBUG_PRINT:
+        print msg
+
+
 def dummy_job_test():
     # dummy debug job
     dummy_job_dict = {
@@ -763,36 +810,56 @@ def dummy_job_test():
     jobA = Job(dummy_job_dict, cache)
     jobB = Job(another_dummy_job_dict, cache)
 
-
+# load contextual files
+debug_print("loading config...")
 config = Config()
+debug_print("loading cache...")
 cache = Cache(config)
+debug_print("loading outbox...")
 outbox = Outbox(config)
 
+# get access to condor
 schedd = htcondor.Schedd()
 const = 'true'
 jobs = []
+
+# grab currently active jobs
 now = int(time.time())
+debug_print("python time: %s" % now)
+debug_print("querying condor_q...")
 for job in schedd.query(const, Job.req_fields):
     jobs.append(Job(job, cache))
     now = job[Ad.server_time]
+n = len(jobs)
+debug_print("%d ongoing jobs found" % n)
+debug_print("server time: %s" % now)
 
+# grab finished jobs since previous run
 const += ' && EnteredCurrentStatus>%s' % cache.first_bin_start_time
-for job in schedd.history(const, Job.req_fields, 10):
+debug_print("querying condor_history with constraint: %s" % const)
+for job in schedd.history(const, Job.req_fields, 99999999):
     jobs.append(Job(job, cache))
+debug_print("%d finished jobs found" % (len(jobs) - n))
+del n
 
+# allocate time since previous run into bins
 bin_times = range(cache.first_bin_start_time, now, config.bin_duration)
+if len(bin_times) < 2:
+    debug_print("daemon called too early since previous run (no bins transpired). Exiting...")
+    exit()
 bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
+debug_print("time domain: %s to %s" % (bin_start_times[0], final_bin_end_time))
 del bin_times
 
-# TODO: debug
-print bin_start_times
+"----------------------------------------------------------------------------------------------------------------------"
 
+# database name on the front end
 db = "LightTestDatabase"
-
 
 # get the number of running jobs anywhere, tagged by owner (and submit site)
 mes = "num running at bin end"
 tags = [Ad.submit_site, Ad.owner]
+debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
@@ -801,10 +868,10 @@ for bin_start_time in bin_start_times:
     results = time_bin.get_sum()
     outbox.add(db, mes, results, time_bin.start_time)
 
-
 # getting the number of running jobs at the end of the bin, tagged by submit site and job site
 mes = "num running at bin end"
 tags = [Ad.submit_site, Ad.job_site]
+debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
@@ -813,21 +880,25 @@ for bin_start_time in bin_start_times:
     results = time_bin.get_sum()                                                  # (method of inclusion)
     outbox.add(db, mes, results, time_bin.start_time)
 
-
 # get the number of idle jobs total in each bin, tagged by owner, submit site and job site
 mes = "num idle total in bin"
 tags = [Ad.owner, Ad.submit_site]
+debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
+    n=0
     for job in jobs:
         if job.is_idle_during(time_bin.start_time, time_bin.end_time):
             time_bin.add_to_sum(1, job.get_values(tags))
+            n+=1
+    print "idle @ %s: %s" % (bin_start_time, n)
+    del n
     outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
-
 
 # get the total CPU
 mes = "total cpu at bin start"
 tags = [Ad.owner, Ad.submit_site, Ad.job_site]
+debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
@@ -835,10 +906,10 @@ for bin_start_time in bin_start_times:
             time_bin.add_to_sum(job.get_running_value_at(Ad.cpu_time, time_bin.start_time), job.get_values(tags))
     outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
 
-
 # get the CPU efficiency of jobs tagged by owner, submit site and job site
 mes = "cpu efficiency"
 tags = [Ad.owner, Ad.submit_site, Ad.job_site]
+debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
     for job in jobs:
