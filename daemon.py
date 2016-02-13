@@ -7,8 +7,13 @@ import json
 
 DEBUG_PRINT = True
 
+# TODO: refactor to specify multiple values
+# and format the measurement as name [values,values] (tags, tags)
+
 """
-PITFALLS TO AVOID
+PITFALLS
+
+- NumJobStarts may be completely unreliable
 
 - RemoteUserCpu updates only when the Job check-points.
 
@@ -18,7 +23,7 @@ PITFALLS TO AVOID
 - Only jobs from Condor_q have ServerTime
 -> python time substituted
 
-- RemoteWallClockTime is not updated until job stops running (evicted, suspended, terminated or completed)
+- RemoteWallClockTime is not updated until job stops running (suspended, terminated or completed. Dunno about evicted)
 -> is updated to include current job runtime
 
 - RemoteWallClockTime includes CumulativeSuspensionTime
@@ -32,10 +37,9 @@ PITFALLS TO AVOID
 
 """
 
-#TODO: UCI isn't contributing to IDLE! why the fuck not?
 
-
-# TODO: get TotalSuspensions, CumulativeSuspensionTime
+# TODO: get TotalSuspensions, CumulativeSuspensionTime, LastCkptTime
+# TODO: (waiting for response from Condor)
 
 
 class FileManager(object):
@@ -112,7 +116,7 @@ class NetworkManager(object):
             tags = ','.join(['%s=%s' % (tag, datum[1][tag]) for tag in datum[1]])
             body += '%s,%s value=%s %s\n' % (mes, tags, datum[0], t)
 
-        # cut off trailing newlin
+        # cut off trailing newline
         return body[:-1]
 
     @staticmethod
@@ -195,41 +199,6 @@ class Outbox(object):
     def save(self):
         """save the outbox back to file"""
         FileManager.write_to_file(self.outgoing, FileManager.FN_OUTBOX)
-
-
-class Config(object):
-    """loads and provides access to configurable daemon settings"""
-    JSON_FIELD_BIN_DURATION = "BIN DURATION"
-    JSON_FIELD_DATABASE_URL = "DATABASE URL"
-    JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
-
-    def __init__(self):
-
-        # initial_values give a field's initial value in a job,
-        # when that value changes and from when it is (re)initialised
-        # {field: [init val, status or boundary of value change, time of initialisation]
-
-        # try to load the config, creating with defaults otherwise
-        try:
-            j = FileManager.load_file(FileManager.FN_CONFIG)
-            self.bin_duration = j[Config.JSON_FIELD_BIN_DURATION]
-            self.database_url = j[Config.JSON_FIELD_DATABASE_URL]
-            self.initial_values = j[Config.JSON_FIELD_INIT_VALUES]
-
-        except IOError:
-            self.bin_duration = 5*60
-            self.database_url = 'http://localhost:8086'
-            self.initial_values = {
-                Ad.cpu_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
-                Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
-                Ad.num_run_starts: [0, 'IDLE|RUNNING', Ad.queue_time]
-            }
-            obj = {
-                Config.JSON_FIELD_BIN_DURATION: self.bin_duration,
-                Config.JSON_FIELD_DATABASE_URL: self.database_url,
-                Config.JSON_FIELD_INIT_VALUES: self.initial_values
-            }
-            FileManager.write_to_file(obj, FileManager.FN_CONFIG)
 
 
 class Cache(object):
@@ -500,7 +469,7 @@ class Job(object):
 
         self.status = ad[Ad.status]
         self.owner = ad[Ad.owner]
-        self.cpu_time = ad[Ad.cpu_time]   # updates every 6 minutes in Condor bindings/binaries
+
         self.server_time = ad[Ad.server_time] if (Ad.server_time in ad) else int(time.time())
 
         # number of job starts and wall time doesn't include current running job (add it)
@@ -583,7 +552,7 @@ class Job(object):
         """returns whether the job was previously (the very previous) in the transferring output state"""
         return self.prev_status == Job.Status.TRANSFERRING_OUTPUT
 
-    def get_time_span_idle(self):
+    def get_most_recent_time_span_idle(self):
         """
         returns the time span  (start, end) of job's most recent idle state
         (if still idle, span end is False)
@@ -610,13 +579,13 @@ class Job(object):
             return self.queue_time, self.entered_status_time
 
         raise RuntimeError(
-                "get_time_span_idle didn't return anything (unexpected job statuses)\n" +
+                "get_most_recent_time_span_idle didn't return anything (unexpected job statuses)\n" +
                 "JobStatus: %s, LastJobStatus: %s, NumJobStarts: %s" % (self.status,
                                                                         self.prev_status,
                                                                         self.num_run_starts)
         )
 
-    def get_time_span_running(self):
+    def get_most_recent_time_span_running(self):
         """
         returns the time span of the job's most recent running state in format (start, end).
         start will be False if never run. end will be False if still running (and start not False)
@@ -643,11 +612,17 @@ class Job(object):
             return False, False
 
         raise RuntimeError(
-                "get_time_span_running didn't return anything (unexpected job statuses)\n" +
+                "get_most_recent_time_span_running didn't return anything (unexpected job statuses)\n" +
                 "JobStatus: %s, LastJobStatus: %s, NumJobStarts: %s" % (self.status,
                                                                         self.prev_status,
                                                                         self.num_run_starts)
         )
+
+    def get_time_spans_running(self):
+        pass
+
+    def get_time_spans_idle(self):
+        pass
 
     def is_idle_during(self, t0, t1):
         """
@@ -655,7 +630,7 @@ class Job(object):
         job's most recent period of idleness (so may be technically incorrect if idle multiple times)
         """
         # i1 is False if the job is still idle
-        i0, i1 = self.get_time_span_idle()
+        i0, i1 = self.get_most_recent_time_span_idle()
         i1 = i1 if i1 else t1
 
         # idle during [t0, t1] if it doesn't end before or start after
@@ -667,7 +642,7 @@ class Job(object):
         the job's most recent period of running (so may be technically incorrect if has run multiple times)
         """
         # r1 is False if the job is still running
-        r0, r1 = self.get_time_span_running()
+        r0, r1 = self.get_most_recent_time_span_running()
         r1 = r1 if r1 else t1
 
         # running during [t0, t1] if it ever ran (r0 not False) and doesn't end before or start after
@@ -676,7 +651,7 @@ class Job(object):
     def get_time_idle_in(self, t0, t1):
         """returns the duration (seconds) for which the job is idle within times t0 and t1"""
         # i1 is False if the job is still ide
-        i0, i1 = self.get_time_span_idle()
+        i0, i1 = self.get_most_recent_time_span_idle()
         i1 = i1 if i1 else t1
 
         # time within bin appears negative if [t0, t1] & [i0, i1] are disjoint (but should be 0)
@@ -686,7 +661,7 @@ class Job(object):
     def get_time_running_in(self, t0, t1):
         """returns the duration (seconds) for which the job is running within t0 to t1"""
         # r1 is False if the job is still running
-        r0, r1 = self.get_time_span_running()
+        r0, r1 = self.get_most_recent_time_span_running()
         r1 = r1 if r1 else t1
 
         # r0 is False if the job has never run
@@ -718,7 +693,7 @@ class Job(object):
 
         # use the currently known value and find when this value was reached (end of job's run status, or now)
         next_val = self.ad[field]
-        _, next_time = self.get_time_span_running()
+        _, next_time = self.get_most_recent_time_span_running()
         # if job is still running, the value corresponds to now (server time)
         if not next_time:
             next_time = self.server_time
@@ -744,7 +719,7 @@ class Job(object):
 
         # get the currently known value and find when this value was reached (end of job's run status, or now)
         next_val = self.ad[field]
-        _, next_time = self.get_time_span_running()
+        _, next_time = self.get_most_recent_time_span_running()
         # if job is still running, the value corresponds to now (server time)
         if not next_time:
             next_time = self.server_time
@@ -761,11 +736,111 @@ class Job(object):
         return prev_val + (next_val - prev_val)/float(next_time - prev_time) * (t - prev_time)
 
 
+class Config(object):
+    """loads and provides access to configurable daemon settings"""
+
+    JSON_FIELD_BIN_DURATION = "BIN DURATION"
+    JSON_VALUE_BIN_DURATION_DEFAULT = 5*60
+
+    JSON_FIELD_DATABASE_URL = "DATABASE URL"
+    JSON_VALUE_DATABASE_URL_EMPTY = "enter the database's domain here"
+
+    JSON_FIELD_COLLECTOR_ADDRESS = "COLLECTOR ADDRESS"
+    JSON_VALUE_COLLECTOR_ADDRESS_LOCAL = "LOCAL"
+
+    JSON_FIELD_JOB_CONSTRAINT = "JOB CONSTRAINT"
+    JSON_VALUE_JOB_CONSTRAINT_DEFAULT = "true"
+
+    JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
+    JSON_VALUE_INIT_VALUES_DEFAULT = {
+                Ad.cpu_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
+                Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time]
+    }
+
+    class DaemonMode(object):
+        GRID = "GRID"
+        BATCH = "BATCH"
+
+    def __init__(self):
+
+        # initial_values give a field's initial value in a job,
+        # when that value changes and from when it is (re)initialised
+        # {field: [init val, status or boundary of value change, time of initialisation]
+
+        # try to load the config, creating with defaults otherwise
+        try:
+            j = FileManager.load_file(FileManager.FN_CONFIG)
+            self.bin_duration = j[Config.JSON_FIELD_BIN_DURATION]
+            self.database_url = j[Config.JSON_FIELD_DATABASE_URL]
+            self.initial_values = j[Config.JSON_FIELD_INIT_VALUES]
+            self.collector_address = j[Config.JSON_FIELD_COLLECTOR_ADDRESS]
+            self.constraint = j[Config.JSON_FIELD_JOB_CONSTRAINT]
+
+        except IOError:
+            self.bin_duration = Config.JSON_VALUE_BIN_DURATION_DEFAULT
+            self.database_url = Config.JSON_VALUE_DATABASE_URL_EMPTY
+            self.initial_values = Config.JSON_VALUE_INIT_VALUES_DEFAULT
+            self.collector_address = Config.JSON_VALUE_COLLECTOR_ADDRESS_LOCAL
+            self.constraint = Config.JSON_VALUE_JOB_CONSTRAINT_DEFAULT
+            obj = {
+                Config.JSON_FIELD_BIN_DURATION: self.bin_duration,
+                Config.JSON_FIELD_DATABASE_URL: self.database_url,
+                Config.JSON_FIELD_INIT_VALUES: self.initial_values,
+                Config.JSON_FIELD_COLLECTOR_ADDRESS: self.collector_address,
+                Config.JSON_FIELD_JOB_CONSTRAINT: self.constraint
+            }
+            FileManager.write_to_file(obj, FileManager.FN_CONFIG)
+
+        # notify and exit if daemon needs configuration
+        if self.database_url == Config.JSON_VALUE_DATABASE_URL_EMPTY:
+            print ("Please configure the daemon (edit %s) " % FileManager.FN_CACHE +
+                   "and specify the URL at which the influx databases reside (in %s)." % Config.JSON_FIELD_DATABASE_URL +
+                    "\nExiting..." )
+            exit()
+
+
+class Condor(object):
+
+    def __init__(self, config):
+
+        self.constraint = config.constraint
+
+        addr = config.collector_address
+        if (addr == Config.JSON_VALUE_COLLECTOR_ADDRESS_LOCAL) or (addr.strip() == ""):
+            debug_print("Contacting the local collector")
+            collector = htcondor.Collector()
+
+        else:
+            debug_print("Contacting a non-local collector (%s)" % config.collector_address)
+            collector = htcondor.Collector(config.collector_address)
+        debug_print("Fetching schedds from collector")
+        self.schedds = map(htcondor.Schedd, collector.locateAll(htcondor.DaemonTypes.Schedd))
+
+        # will be updated once jobs are requested (may use server_time from condor_q)
+        self.current_time = int(time.time())
+
+    def get_jobs(self, cache):
+
+        history_constraint = "((%s) && (EnteredCurrentStatus > %s))" % (self.constraint, cache.first_bin_start_time)
+
+        # we want unique jobs (no double counting)
+        jobs = {}
+        for schedd in self.schedds:
+            for ad in schedd.query(self.constraint, Job.req_fields):
+                job = Job(ad, cache)
+                jobs[job.id] = job
+                self.current_time = job.server_time
+            for ad in schedd.history(history_constraint, Job.req_fields, 10000):
+                job = Job(ad, cache)
+                jobs[job.id] = job
+
+        return [jobs[id] for id in jobs]
+
+
 def debug_print(msg):
     if DEBUG_PRINT:
         print msg
 
-# testing new branch
 
 def dummy_job_test():
     # dummy debug job
@@ -811,45 +886,21 @@ def dummy_job_test():
     jobA = Job(dummy_job_dict, cache)
     jobB = Job(another_dummy_job_dict, cache)
 
+
 # load contextual files
-debug_print("loading config...")
 config = Config()
-debug_print("loading cache...")
 cache = Cache(config)
-debug_print("loading outbox...")
+condor = Condor(config)
 outbox = Outbox(config)
 
-# get access to condor
-schedd = htcondor.Schedd()
-const = 'true'
-jobs = []
-
-# grab currently active jobs
-now = int(time.time())
-debug_print("python time: %s" % now)
-debug_print("querying condor_q...")
-for job in schedd.query(const, Job.req_fields):
-    jobs.append(Job(job, cache))
-    now = job[Ad.server_time]
-n = len(jobs)
-debug_print("%d ongoing jobs found" % n)
-debug_print("server time: %s" % now)
-
-# grab finished jobs since previous run
-const += ' && EnteredCurrentStatus>%s' % cache.first_bin_start_time
-debug_print("querying condor_history with constraint: %s" % const)
-for job in schedd.history(const, Job.req_fields, 99999999):
-    jobs.append(Job(job, cache))
-debug_print("%d finished jobs found" % (len(jobs) - n))
-del n
+# get jobs
+jobs = condor.get_jobs(cache)
 
 # allocate time since previous run into bins
-bin_times = range(cache.first_bin_start_time, now, config.bin_duration)
+bin_times = range(cache.first_bin_start_time, condor.current_time, config.bin_duration)
 if len(bin_times) < 2:
-    debug_print("daemon called too early since previous run (no bins transpired). Exiting...")
     exit()
 bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
-debug_print("time domain: %s to %s" % (bin_start_times[0], final_bin_end_time))
 del bin_times
 
 "----------------------------------------------------------------------------------------------------------------------"
@@ -887,15 +938,12 @@ tags = [Ad.owner, Ad.submit_site]
 debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-    n=0
     for job in jobs:
         if job.is_idle_during(time_bin.start_time, time_bin.end_time):
             time_bin.add_to_sum(1, job.get_values(tags))
-            n+=1
-    print "idle @ %s: %s" % (bin_start_time, n)
-    del n
     outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
 
+'''
 # get the total CPU
 mes = "total cpu at bin start"
 tags = [Ad.owner, Ad.submit_site, Ad.job_site]
@@ -920,7 +968,9 @@ for bin_start_time in bin_start_times:
             time_bin.add_to_division_of_sums(100 * cpu, wall, job.get_values(tags))
     results = time_bin.get_division_of_sums()
     outbox.add(db, mes, results, bin_start_time)
+'''
 
+"----------------------------------------------------------------------------------------------------------------------"
 
 # push to influx
 outbox.push_outgoing()
