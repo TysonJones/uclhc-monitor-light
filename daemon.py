@@ -13,7 +13,11 @@ DEBUG_PRINT = True
 """
 PITFALLS
 
-- NumJobStarts may be completely unreliable
+- NumJobStarts may be completely unreliable (not used in standard universe jobs)
+-> avoid
+
+- MATCH_EXP_JOB_Site will be 'Unknown' if the job runs on the brick
+-> check if so and set to be SUBMIT_SITE
 
 - RemoteUserCpu updates only when the Job check-points.
 
@@ -38,8 +42,88 @@ PITFALLS
 """
 
 
-# TODO: get TotalSuspensions, CumulativeSuspensionTime, LastCkptTime
-# TODO: (waiting for response from Condor)
+"""
+QUESTIONS
+
+- Does suspension count as a restart (in NumJobStarts), like eviction?
+
+"""
+
+
+class Ad(object):
+    """Condor classad fields specifically considered"""
+
+    # global job identifier (unique between all jobs), used for caching
+    id = "GlobalJobId"
+
+    # current and previous (if exists) status of the job (numerical 1-6)
+    status = "JobStatus"
+    prev_status = "LastJobStatus"
+
+    # time the job last check pointed (had some fields upddated)
+    # TODO last_update_time = "LastCkptTime"
+    # total seconds of CPU use of a job (sum them), reset at eviction [updated at job checkpoint or exit]
+    # TODO last_cpu_user_duration = "RemoteUserCpu"
+    # TODO last_cpu_sys_duration = "RemoteSysCpu"
+    # total seconds job has run or was suspended, conserved over evictions [updated at job checkpoint or exit]
+    # TODO all_wall_duration = "RemoteWallClockTime"
+    # total seconds job has ever spent in suspension, conserved over evictions [updated at job checkpoint or exit]
+    # TODO all_suspension_duration = "CumulativeSuspensionTime"
+    # total seconds job has run or was suspended, reset at eviction [updated at job checkpoint or exit]
+    # TODO last_wall_duration = "CommittedTime"
+    # total seconds job has been suspended, reset at eviction [updated at job checkpoint or exit]
+    # TODO last_suspended_duration = "CommittedSuspensionTime"
+    # number of times the job has been started (not defined for standard universe) and suspended
+    # TODO num_run_starts = "NumJobStarts"
+    # TODO num_suspensions = "TotalSuspensions"  # conserved over evictions
+    # number of cpus given to the job
+    # num_cpus = "CpusProvisioned"
+
+    # TODO: discard any time before the last eviction
+
+    # site at which the job was submitted and ran (last), the latter requiring correction sometimes
+    submit_site = "SUBMIT_SITE"
+    job_site = "MATCH_EXP_JOB_Site"
+
+    # current time
+    server_time = "ServerTime"
+
+    # time of job first entering queue
+    queue_time = "QDate"
+
+    # start times of the job's FIRST, PREVIOUS (not current) and CURRENT (most recent) runs
+    first_run_start_time = "JobStartDate"
+    prev_run_start_time = "JobLastStartDate"
+    last_run_start_time = "JobCurrentStartDate"    # ~ JobCurrentStartExecutingDate
+
+    # last times the job was evicted (pushed back to global queue) and suspended (re-idled at machine)
+    # TODO last_evict_time = "LastVacateTime"
+    # TODO last_suspend_time = "LastSuspensionTime"
+
+    # time the job entered its current status
+    entered_status_time = "EnteredCurrentStatus"
+
+    # time the job completed
+    # TODO completion_date = "CompletionDate"
+
+    # Example of a job
+
+    # JobStatus                    (2)
+    # LastJobStatus                (1)
+    # NumJobStarts                 (2)
+
+    # QDate                        (1454718023)
+
+    # JobStartDate                 (1454718084)
+    # JobLastStartDate             (1454718084)
+
+    # LastVacateTime               (1454787327)
+    # LastSuspensionTime???
+
+    # JobCurrentStartDate          (1454787679)
+    # JobCurrentStartExecutingDate (1454787680)
+
+    # EnteredCurrentStatus         (1454787679)
 
 
 class FileManager(object):
@@ -357,91 +441,17 @@ class Bin(object):
         return divisions
 
 
-class Ad(object):
-    """Condor classad fields specifically considered"""
-
-    # global job identifier (unique between all jobs)
-    id = "GlobalJobId"
-
-    # username of submitter of the job
-    owner = "Owner"
-
-    # username and their domain (Owner@domain) of the job submitter
-    user = "User"
-
-    # total seconds of CPU use of a job
-    cpu_time = "RemoteUserCpu"
-
-    # site at which the job was submitted
-    submit_site = "SUBMIT_SITE"
-
-    # site at which the job runs
-    job_site = "MATCH_EXP_JOB_Site"
-
-    # status of the job (numerical 1-6)
-    status = "JobStatus"
-
-    # previous status of the job (numerical 1-6)
-    prev_status = "LastJobStatus"
-
-    # current time on the Condor server
-    server_time = "ServerTime"
-
-    # total seconds of wall time (e.g. IO time) of the job
-    wall_time = "RemoteWallClockTime"
-
-    # time (seconds since epoch) of job entering queue
-    queue_time = "QDate"
-
-    # start time (seconds since epoch) of the job's FIRST run
-    first_run_start_time = "JobStartDate"
-
-    # start time (seconds since epoch) of the job's PREVIOUS (not current) run
-    prev_run_start_time = "JobLastStartDate"
-
-    # number of times the job has been started
-    num_run_starts = "NumJobStarts"
-
-    # last time (seconds since epoch) the job was evicted (stopped running, pushed back to global queue)
-    last_evict_time = "LastVacateTime"
-
-    # last time (seconds since epoch) the job was suspended (stopped running, still waits at mchine)
-    last_suspend_time = "LastSuspensionTime"
-
-    # start time (seconds since epoch) of the job's MOST RECENT (may be current) run
-    last_run_start_time = "JobCurrentStartDate"    # also JobCurrentStartExecutingDate (1s dif)
-
-    # time (seconds since epoch) of the job entering its current status
-    entered_status_time = "EnteredCurrentStatus"
-
-    # Example of a job
-
-    # JobStatus                    (2)
-    # LastJobStatus                (1)
-    # NumJobStarts                 (2)
-
-    # QDate                        (1454718023)
-
-    # JobStartDate                 (1454718084)
-    # JobLastStartDate             (1454718084)
-
-    # LastVacateTime               (1454787327)
-
-    # JobCurrentStartDate          (1454787679)
-    # JobCurrentStartExecutingDate (1454787680)
-
-    # EnteredCurrentStatus         (1454787679)
-
-
 class Job(object):
     """A single Condor job container"""
 
+    '''
     # required condor classad fields for a job
     req_fields = [
         Ad.id, Ad.submit_site, Ad.job_site, Ad.status, Ad.prev_status, Ad.num_run_starts,
         Ad.first_run_start_time, Ad.prev_run_start_time, Ad.last_evict_time, Ad.last_run_start_time,
         Ad.entered_status_time, Ad.queue_time, Ad.owner, Ad.cpu_time, Ad.wall_time, Ad.server_time,
     ]
+    '''
 
     class Status(object):
         IDLE = 1
@@ -459,7 +469,7 @@ class Job(object):
             HELD = "HELD"
             TRANSFERRING_OUTPUT = "TRANSFERRING OUTPUT"
 
-    # optimises space use of many Job instances
+    # TODO optimises space use of many Job instances
     # __slots__ = ('id', 'owner', 'cpu', 'submit_site', 'job_site')
 
     def __init__(self, ad, cache):
@@ -467,42 +477,49 @@ class Job(object):
         self.ad = ad
         self.cache = cache
 
+        self.id = ad[Ad.id]
         self.status = ad[Ad.status]
-        self.owner = ad[Ad.owner]
-
+        self.prev_status = ad[Ad.prev_status] if (Ad.prev_status in ad) else None
+        self.queue_time = ad[Ad.queue_time]
         self.server_time = ad[Ad.server_time] if (Ad.server_time in ad) else int(time.time())
 
+
+        '''
         # number of job starts and wall time doesn't include current running job (add it)
         if ad[Ad.status] == Job.Status.RUNNING:
             ad[Ad.wall_time] += ad[Ad.server_time] - ad[Ad.last_run_start_time]
             ad[Ad.num_run_starts] += 1
         self.wall_time = ad[Ad.wall_time]
         self.num_run_starts = ad[Ad.num_run_starts]
+        '''
 
-        self.id = ad[Ad.id]
-        self.submit_site = ad[Ad.submit_site]
+
 
         # idle jobs having never run don't have job sites
-        self.job_site = ad[Ad.job_site] if (Ad.job_site in ad) else None
-
-        # running on brick gives dud job site
-        if self.job_site == "Unknown":
-            self.job_site = self.submit_site
-
-        self.queue_time = ad[Ad.queue_time]
-
-        # idle jobs having never run don't have a previous status
-        self.prev_status = ad[Ad.prev_status] if (Ad.prev_status in ad) else None
+        if (Ad.submit_site in ad) and (Ad.job_site in ad) and (ad[Ad.job_site] == "Unknown"):
+            ad[Ad.job_site] = ad[Ad.submit_site]
 
         # idle jobs having never run don't have a first run start time, or a previous
         self.first_run_start_time = ad[Ad.first_run_start_time] if (Ad.first_run_start_time in ad) else None
 
         # if the job has only started running once or twice (not completed twice), this will equal first
         self.prev_run_start_time = ad[Ad.prev_run_start_time] if (Ad.prev_run_start_time in ad) else None
-
         self.last_run_start_time = ad[Ad.last_run_start_time] if (Ad.last_run_start_time in ad) else None
-        self.last_evict_time = ad[Ad.last_evict_time] if (Ad.last_evict_time in ad) else None
         self.entered_status_time = ad[Ad.entered_status_time] if (Ad.entered_status_time in ad) else None
+
+    @staticmethod
+    def get_all_required_fields(desired_fields):
+
+        # TODO: implemenent this (i.e. if certain cpu fields required, demand time fields)
+        # TODO: actually make the rest of the code use this
+
+
+        # job site is 'Unknown' when it runs on the brick, requiring default to submit site
+        if (Ad.job_site in desired_fields) and (Ad.submit_site not in desired_fields):
+            desired_fields.append(Ad.submit_site)
+
+
+        return desired_fields
 
     def get_values(self, fields):
         """returns a dict of field name to the job's current value for all the passed fields"""
