@@ -7,11 +7,19 @@ import json
 
 DEBUG_PRINT = True
 
+# TODO: metric config parsing system (just do RAW with caching and interpolation: NO change
+# TODO: HOWEVER, first you should just write code to do a RAW one and see it successful on Grafana
+
 # TODO: refactor to specify multiple values
-# and format the measurement as name [values,values] (tags, tags)
+# and format the measurement as name (tags, tags)
 
 """
 PITFALLS
+
+- Last status checks can be before eviction times, but run information is lost from classad on eviction
+(specifically, CommitedTime, RemoteWallClockTime, etc. Check the Condor manual to see
+http://research.cs.wisc.edu/htcondor/manual/v8.4/condor-V8_4_4-Manual.pdf)
+-> avoid correlating these
 
 - NumJobStarts may be completely unreliable (not used in standard universe jobs)
 -> avoid
@@ -79,7 +87,9 @@ class Ad(object):
     # number of cpus given to the job
     # num_cpus = "CpusProvisioned"
 
-    # TODO: discard any time before the last eviction
+    # not actually needed, but relevant
+    # TODO first_run_start_time = "JobStartDate"         (very first run start time)
+    # TODO prev_run_start_time = "JobLastStartDate"      (previous - not current - run start time. May equal first)
 
     # site at which the job was submitted and ran (last), the latter requiring correction sometimes
     submit_site = "SUBMIT_SITE"
@@ -91,20 +101,18 @@ class Ad(object):
     # time of job first entering queue
     queue_time = "QDate"
 
-    # start times of the job's FIRST, PREVIOUS (not current) and CURRENT (most recent) runs
-    first_run_start_time = "JobStartDate"
-    prev_run_start_time = "JobLastStartDate"
+    # start times of the job's latest run
     last_run_start_time = "JobCurrentStartDate"    # ~ JobCurrentStartExecutingDate
 
     # last times the job was evicted (pushed back to global queue) and suspended (re-idled at machine)
-    # TODO last_evict_time = "LastVacateTime"
-    # TODO last_suspend_time = "LastSuspensionTime"
+    last_evict_time = "LastVacateTime"
+    last_suspend_time = "LastSuspensionTime"
 
     # time the job entered its current status
     entered_status_time = "EnteredCurrentStatus"
 
     # time the job completed
-    # TODO completion_date = "CompletionDate"
+    completion_date = "CompletionDate"
 
     # Example of a job
 
@@ -118,7 +126,7 @@ class Ad(object):
     # JobLastStartDate             (1454718084)
 
     # LastVacateTime               (1454787327)
-    # LastSuspensionTime???
+    # LastSuspensionTime           [never suspended]
 
     # JobCurrentStartDate          (1454787679)
     # JobCurrentStartExecutingDate (1454787680)
@@ -255,13 +263,12 @@ class Outbox(object):
         failed = {}
         for database in self.outgoing:
 
-            # ensure database exists (if it fails, all pushes to this db will fail)
+            # ensure database exists (if it fails, maybe pushes to this db won't fail?)
             try:
                 query = "CREATE DATABASE IF NOT EXISTS %s" % database
                 NetworkManager.http_connect(self.url + 'query?' + urllib.urlencode({'q': query}))
             except urllib2.HTTPError:
-                failed[database] = self.outgoing[database]
-                continue
+                print "Error! Attempting to create database %s if nonexistant failed! Continuing..." % database
 
             # database exists; fragment data and push each
             args = urllib.urlencode({'db': database, 'precision': 's'})
@@ -273,6 +280,8 @@ class Outbox(object):
                 try:
                     NetworkManager.http_connect(self.url + 'write?' + args, fragment)
                 except urllib2.HTTPError as e:
+                    print "Error! Pushing some data to database %s at %s failed! Continuing..." % (database, self.url)
+
                     if database in failed:
                         failed[database] += '\n' + fragment
                     else:
@@ -444,14 +453,22 @@ class Bin(object):
 class Job(object):
     """A single Condor job container"""
 
-    '''
-    # required condor classad fields for a job
-    req_fields = [
-        Ad.id, Ad.submit_site, Ad.job_site, Ad.status, Ad.prev_status, Ad.num_run_starts,
-        Ad.first_run_start_time, Ad.prev_run_start_time, Ad.last_evict_time, Ad.last_run_start_time,
-        Ad.entered_status_time, Ad.queue_time, Ad.owner, Ad.cpu_time, Ad.wall_time, Ad.server_time,
+    # fields that are needed by the daemon (even if not in ad) for every job, regardless of metric specific
+    # (do NOT update this if you want a metric to use an ad field not currently collected; that's a 'desired' field)
+    required_fields = [
+        Ad.id,
+        Ad.status,
+        Ad.queue_time,
+        Ad.entered_status_time,
+
+        Ad.prev_status,
+        Ad.server_time,
+
+        Ad.last_run_start_time,  # TODO: check we actually need all these
+        Ad.last_suspend_time,
+        Ad.last_evict_time,
+        Ad.completion_date
     ]
-    '''
 
     class Status(object):
         IDLE = 1
@@ -469,8 +486,22 @@ class Job(object):
             HELD = "HELD"
             TRANSFERRING_OUTPUT = "TRANSFERRING OUTPUT"
 
-    # TODO optimises space use of many Job instances
-    # __slots__ = ('id', 'owner', 'cpu', 'submit_site', 'job_site')
+    #TODO: check these
+    # optimises space use of many Job instances
+    __slots__ = ('ad', 'cache',
+
+                 'id',
+                 'status',
+                 'queue_time',
+                 'entered_status_time',
+
+                 'prev_status',
+                 'server_time',
+
+                 'last_run_start_time',
+                 'last_suspend_time',
+                 'last_evict_time',
+                 'completion_date')
 
     def __init__(self, ad, cache):
         """requires the job's condor classad, and a handle to the global job cache"""
@@ -479,47 +510,41 @@ class Job(object):
 
         self.id = ad[Ad.id]
         self.status = ad[Ad.status]
-        self.prev_status = ad[Ad.prev_status] if (Ad.prev_status in ad) else None
         self.queue_time = ad[Ad.queue_time]
+        self.entered_status_time = ad[Ad.entered_status_time]
+
+        # fresh jobs to queue don't have prev status, and condor_history jobs lack server_time
+        self.prev_status = ad[Ad.prev_status] if (Ad.prev_status in ad) else None
         self.server_time = ad[Ad.server_time] if (Ad.server_time in ad) else int(time.time())
 
-
-        '''
-        # number of job starts and wall time doesn't include current running job (add it)
-        if ad[Ad.status] == Job.Status.RUNNING:
-            ad[Ad.wall_time] += ad[Ad.server_time] - ad[Ad.last_run_start_time]
-            ad[Ad.num_run_starts] += 1
-        self.wall_time = ad[Ad.wall_time]
-        self.num_run_starts = ad[Ad.num_run_starts]
-        '''
-
-
-
-        # idle jobs having never run don't have job sites
-        if (Ad.submit_site in ad) and (Ad.job_site in ad) and (ad[Ad.job_site] == "Unknown"):
-            ad[Ad.job_site] = ad[Ad.submit_site]
-
-        # idle jobs having never run don't have a first run start time, or a previous
-        self.first_run_start_time = ad[Ad.first_run_start_time] if (Ad.first_run_start_time in ad) else None
-
-        # if the job has only started running once or twice (not completed twice), this will equal first
-        self.prev_run_start_time = ad[Ad.prev_run_start_time] if (Ad.prev_run_start_time in ad) else None
+        # not all jobs have been run, suspended, evicted or completed
         self.last_run_start_time = ad[Ad.last_run_start_time] if (Ad.last_run_start_time in ad) else None
-        self.entered_status_time = ad[Ad.entered_status_time] if (Ad.entered_status_time in ad) else None
+        self.last_suspend_time = ad[Ad.last_suspend_time] if (Ad.last_suspend_time in ad) else None
+        self.last_evict_time = ad[Ad.last_evict_time] if (Ad.last_evict_time in ad) else None
+        self.completion_date = ad[Ad.completion_date] if (Ad.completion_date in ad) else None
 
-    @staticmethod
-    def get_all_required_fields(desired_fields):
+        # fix the shitty bad condor fields
+        self.fix_ad()
 
-        # TODO: implemenent this (i.e. if certain cpu fields required, demand time fields)
-        # TODO: actually make the rest of the code use this
+    def fix_ad(self):
+        """
+        tinkers with some job classad fields which condor leaves invalid or problematic
+        """
 
+        # TODO: fix checkpoint dependent fields (cpu time, wall time, num starts, etc)
 
-        # job site is 'Unknown' when it runs on the brick, requiring default to submit site
-        if (Ad.job_site in desired_fields) and (Ad.submit_site not in desired_fields):
-            desired_fields.append(Ad.submit_site)
+        # jobs run on brick don't have site 'Unknown'
+        if (Ad.job_site in self.ad) and (self.ad[Ad.job_site] == "Unknown"):
 
+            if Ad.submit_site in self.ad:
+                self.ad[Ad.job_site] = self.ad[Ad.submit_site]
 
-        return desired_fields
+            else:
+                raise RuntimeError("A job had an 'Unknown' MATCH_EXP_JOB_Site, so needed defaulting to its " +
+                                   "submit site. The SUBMIT_SITE field however was not present in the classad! " +
+                                   "This probably means get_all_required_fields wasn't called. It is needed " +
+                                   "to be called, passing the desired fields to collect from jobs, such " +
+                                   "that substitute fields (like submit site) are also collected.")
 
     def get_values(self, fields):
         """returns a dict of field name to the job's current value for all the passed fields"""
@@ -574,72 +599,111 @@ class Job(object):
         returns the time span  (start, end) of job's most recent idle state
         (if still idle, span end is False)
         """
+        # if currently idle, it's been so since status change!
         if self.is_idle():
+            entered = self.entered_status_time
+            exited = False
 
-            # if the job has run previously (i.e. it has been evicted after running)
+        # if it was previously idle, it entered either at queue or when evicted or suspended
+        elif self.was_idle():
+            entered = max(self.queue_time, self.last_evict_time, self.last_suspend_time)
+            exited = self.entered_status_time
+
+        # otherwise job has been in at least two states since idle (let's assume it was just before last 2 states)
+        else:
+            entered = max(self.queue_time, self.last_evict_time, self.last_suspend_time)
+
+            # if it was just running, we know when that started
             if self.was_running():
-                return self.last_evict_time, False
+                exited = self.last_run_start_time
 
-            # otherwise the job has been idle since queued
-            return self.queue_time, False
+            # TODO: otherwise, we have no idea!
+            else:
+                exited = None
 
-        # if the job has only started running once, idle has been from queue to first run
-        if (self.is_running() or self.was_running()) and (self.num_run_starts == 1):
-            return self.queue_time, self.first_run_start_time
+        # error checking
+        if None in [entered, exited]:
+            raise ValueError("get_most_recent_time_span_idle returned a None " +
+                             "(a required classad was missing from job, " +
+                             "or we couldn't determine when the idle state ended)!\n" +
+                             "status: %s, prev status: %s" % (self.status, self.prev_status))
 
-        # if the job has run more than once, it was idle from its last eviction to its last run
-        if (self.is_running() or self.was_running()) and (self.num_run_starts > 1):
-            return self.last_evict_time, self.last_run_start_time
-
-        # otherwise, the job has been removed while idle
-        if self.is_removed():
-            return self.queue_time, self.entered_status_time
-
-        raise RuntimeError(
-                "get_most_recent_time_span_idle didn't return anything (unexpected job statuses)\n" +
-                "JobStatus: %s, LastJobStatus: %s, NumJobStarts: %s" % (self.status,
-                                                                        self.prev_status,
-                                                                        self.num_run_starts)
-        )
+        return entered, exited
 
     def get_most_recent_time_span_running(self):
         """
         returns the time span of the job's most recent running state in format (start, end).
         start will be False if never run. end will be False if still running (and start not False)
         """
-        if self.is_idle():
-
-            # if currently idle but ran, the job was evicted
-            if self.was_running():
-                return self.last_run_start_time, self.last_evict_time
-
-            # otherwise the job has been idle sinced queued and never run
-            return False, False
-
-        # if the job is running (no matter how many times it has previously run), return last start
+        # if currently running, it's been so since status change!
         if self.is_running():
-            return self.last_run_start_time, False
+            entered = self.last_run_start_time
+            exited = False
 
-        # if the job was running (it's now removed, completed, held, transferring or re-idled):
-        if self.was_running():
-            return self.last_run_start_time, self.entered_status_time
+        # if running previously, it ended at the status change
+        elif self.was_running():
+            entered = self.last_run_start_time
+            exited = self.entered_status_time
 
-        # otherwise the job was removed whilst idle and never ran
-        if self.is_removed():
-            return False, False
+        # if the job has never run, we'll return a first False
+        elif not self.last_run_start_time:
+            entered = False
+            exited = False
 
-        raise RuntimeError(
-                "get_most_recent_time_span_running didn't return anything (unexpected job statuses)\n" +
-                "JobStatus: %s, LastJobStatus: %s, NumJobStarts: %s" % (self.status,
-                                                                        self.prev_status,
-                                                                        self.num_run_starts)
-        )
+        # if the job completed (and had some transfer state after running)
+        elif self.is_completed():
+            entered = self.last_run_start_time
+            exited = self.completion_date
 
-    def get_time_spans_running(self):
-        pass
+        # if the job is about to complete (it was held before or something), approximate ending to now state
+        elif self.is_transferring_output():
+            entered = self.last_run_start_time
+            exited = self.entered_status_time
 
-    def get_time_spans_idle(self):
-        pass
+        # if the job was removed (whilst transferring output or something), approximate ending to removal
+        elif self.is_removed():
+            entered = self.last_run_start_time
+            exited = self.entered_status_time
+
+        # otherwise the job was running and was suspended or evicted
+        else:
+            entered = self.last_run_start_time
+
+            # if it's been both evicted and suspended at some point, job ended at most recent after it started
+            if self.last_evict_time and self.last_suspend_time:
+
+                # if it's been both exited and suspended since starting, it ended at the earlier
+                if (self.last_evict_time > entered) and (self.last_suspend_time > entered):
+                    exited = min(self.last_evict_time, self.last_suspend_time)
+
+                # if only one of eviction or suspension was after starting, it ended then
+                elif self.last_evict_time > entered:
+                    exited = self.last_evict_time
+                elif self.last_suspend_time > entered:
+                    exited = self.last_suspend_time
+
+                # TODO: the latest eviction and suspension being before the latest job start is impossible!
+                else:
+                    exited = None
+
+            # otherwise it's been either evicted or suspended
+            elif self.last_evict_time and (self.last_evict_time > entered):
+                exited = self.last_evict_time
+            elif self.last_suspend_time and (self.last_suspend_time > entered):
+                exited = self.last_suspend_time
+
+            # TODO: it is impossible to have no evictions/suspensions after the job started running
+            else:
+                exited = None
+
+        # error checking
+        if None in [entered, exited]:
+            raise ValueError("get_most_recent_time_span_running returned a None " +
+                             "(a required classad was missing from job or " +
+                             "the combination of run times and suspend/eviction times didn't make sense)!\n" +
+                             "status: %s, prev status: %s" % (self.status, self.prev_status))
+
+        return entered, exited
 
     def is_idle_during(self, t0, t1):
         """
@@ -769,10 +833,15 @@ class Config(object):
     JSON_VALUE_JOB_CONSTRAINT_DEFAULT = "true"
 
     JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
+    JSON_VALUE_INIT_VALUES_DEFAULT = {}
+
+    # TODO
+    '''
     JSON_VALUE_INIT_VALUES_DEFAULT = {
                 Ad.cpu_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
                 Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time]
     }
+    '''
 
     class DaemonMode(object):
         GRID = "GRID"
@@ -820,8 +889,6 @@ class Condor(object):
 
     def __init__(self, config):
 
-        self.constraint = config.constraint
-
         addr = config.collector_address
         if (addr == Config.JSON_VALUE_COLLECTOR_ADDRESS_LOCAL) or (addr.strip() == ""):
             debug_print("Contacting the local collector")
@@ -831,23 +898,46 @@ class Condor(object):
             debug_print("Contacting a non-local collector (%s)" % config.collector_address)
             collector = htcondor.Collector(config.collector_address)
         debug_print("Fetching schedds from collector")
+
         self.schedds = map(htcondor.Schedd, collector.locateAll(htcondor.DaemonTypes.Schedd))
+        self.constraint = config.constraint
 
         # will be updated once jobs are requested (may use server_time from condor_q)
         self.current_time = int(time.time())
 
-    def get_jobs(self, cache):
+    @staticmethod
+    def _get_all_required_fields(desired_fields):
+        """
+        wanting some fields may require others (e.g. for classad tinkering). This method returns a list of
+        all required fields for a job, given a list of those desired by metric specifiers
+        """
+
+        # TODO: actually make the rest of the code use this
+
+        required = list(Job.required_fields) + list(desired_fields)
+
+        # job site is 'Unknown' when it runs on the brick, requiring default to submit site
+        if (Ad.job_site in desired_fields) and (Ad.submit_site not in desired_fields):
+            required.append(Ad.submit_site)
+
+        # TODO: get fields required for fixing checkpoint dependent fields (e.g. ckpt time)
+
+        return required
+
+    def get_jobs(self, cache, desired_fields):
+
+        required_fields = Condor._get_all_required_fields(desired_fields)
 
         history_constraint = "((%s) && (EnteredCurrentStatus > %s))" % (self.constraint, cache.first_bin_start_time)
 
         # we want unique jobs (no double counting)
         jobs = {}
         for schedd in self.schedds:
-            for ad in schedd.query(self.constraint, Job.req_fields):
+            for ad in schedd.query(self.constraint, required_fields):
                 job = Job(ad, cache)
                 jobs[job.id] = job
                 self.current_time = job.server_time
-            for ad in schedd.history(history_constraint, Job.req_fields, 10000):
+            for ad in schedd.history(history_constraint, required_fields, 10000):
                 job = Job(ad, cache)
                 jobs[job.id] = job
 
@@ -860,14 +950,12 @@ def debug_print(msg):
 
 
 def dummy_job_test():
-    # dummy debug job
     dummy_job_dict = {
         Ad.id: "job#123",
         Ad.submit_site: "UCSD",
         Ad.job_site: "UCR",
         Ad.status: 2,
         Ad.prev_status: 1,
-        Ad.num_run_starts: 1,
         Ad.first_run_start_time: 10,
         Ad.prev_run_start_time: None,
         Ad.last_evict_time: None,
@@ -879,14 +967,12 @@ def dummy_job_test():
         Ad.wall_time: 0,    # mimic condor bug
         Ad.server_time: 15
     }
-
     another_dummy_job_dict = {
         Ad.id: "job#666",
         Ad.submit_site: "UCSD",
         Ad.job_site: "UCR",
         Ad.status: 1,              # it re-idled
         Ad.prev_status: 2,
-        Ad.num_run_starts: 1,
         Ad.first_run_start_time: -1,
         Ad.prev_run_start_time: None,
         Ad.last_evict_time: 10,
@@ -898,7 +984,6 @@ def dummy_job_test():
         Ad.wall_time: 11,    # left running state, so condor_q fixes wall time
         Ad.server_time: 15
     }
-
     global jobA, jobB
     jobA = Job(dummy_job_dict, cache)
     jobB = Job(another_dummy_job_dict, cache)
@@ -910,8 +995,11 @@ cache = Cache(config)
 condor = Condor(config)
 outbox = Outbox(config)
 
+# TODO: you need to know the classad fields desired by metrics before you collect the jobs
+desired_fields = [Ad.submit_site, "Owner", "SUBMIT_SITE", "MATCH_EXP_JOB_Site", ]
+
 # get jobs
-jobs = condor.get_jobs(cache)
+jobs = condor.get_jobs(cache, desired_fields)
 
 # allocate time since previous run into bins
 bin_times = range(cache.first_bin_start_time, condor.current_time, config.bin_duration)
@@ -922,12 +1010,15 @@ del bin_times
 
 "----------------------------------------------------------------------------------------------------------------------"
 
+#TODO: we can only get status specific info right now (no values or val changes)
+#TODO: all fields (tags) required by the below metrics are specified above in desired
+
 # database name on the front end
-db = "LightTestDatabase"
+db = "Daemon3TestDatabase"
 
 # get the number of running jobs anywhere, tagged by owner (and submit site)
 mes = "num running at bin end"
-tags = [Ad.submit_site, Ad.owner]
+tags = ["SUBMIT_SITE", "Owner"]
 debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
@@ -939,7 +1030,7 @@ for bin_start_time in bin_start_times:
 
 # getting the number of running jobs at the end of the bin, tagged by submit site and job site
 mes = "num running at bin end"
-tags = [Ad.submit_site, Ad.job_site]
+tags = ["SUBMIT_SITE", "MATCH_EXP_JOB_Site"]
 debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
@@ -951,7 +1042,7 @@ for bin_start_time in bin_start_times:
 
 # get the number of idle jobs total in each bin, tagged by owner, submit site and job site
 mes = "num idle total in bin"
-tags = [Ad.owner, Ad.submit_site]
+tags = ["Owner", "SUBMIT_SITE"]
 debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
 for bin_start_time in bin_start_times:
     time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
@@ -994,6 +1085,8 @@ outbox.push_outgoing()
 outbox.save()
 
 # cache fields
+# TODO we've disabled caching for now
+'''
 fields_to_cache = [Ad.cpu_time, Ad.wall_time]
 Cache.save_running_values(final_bin_end_time, jobs, fields_to_cache)
-
+'''
