@@ -1,3 +1,9 @@
+#!/usr/bin/env python
+
+# Author:       Tyson Jones, January 2016 (MURPA student of Prof Frank Wuerthwein, UCSD).
+#               Feel free to contact me at  tjon14@student.monash.edu
+
+# Purpose:      Condorflux daemon; a condor probe for aggregating metric data into influx and grafana
 
 import htcondor
 import urllib
@@ -7,8 +13,15 @@ import json
 
 DEBUG_PRINT = True
 
+# TODO: for the BATCH system, should use LastRemoteHost in place of MATCH_EXP_JOB_Site,
+# but you'll need to split the string at @
+# TODO: however, this makes ugly af job site name.
+# TODO: make a DICT in the CONFIG which maps ugly domain name to the desired name (UCSD)
+# TODO: when checking, if domain is not in the name map, report it and continue
+
 # TODO: metric config parsing system (just do RAW with caching and interpolation: NO change
 # TODO: HOWEVER, first you should just write code to do a RAW one and see it successful on Grafana
+# BATCH_JOB_SITE
 
 # TODO: refactor to specify multiple values
 # and format the measurement as name (tags, tags)
@@ -58,6 +71,13 @@ QUESTIONS
 """
 
 
+class MockAd(object):
+    """fields which can be specified by metrics but aren't actually Condor classads; they're manipulations thereof"""
+
+    # the batch system (no glidein) doesn't have a pretty job site ad. We instead string manipulate the remote site
+    batch_job_site = "BATCH_JOB_SITE"
+
+
 class Ad(object):
     """Condor classad fields specifically considered"""
 
@@ -71,16 +91,16 @@ class Ad(object):
     # time the job last check pointed (had some fields upddated)
     # TODO last_update_time = "LastCkptTime"
     # total seconds of CPU use of a job (sum them), reset at eviction [updated at job checkpoint or exit]
-    # TODO last_cpu_user_duration = "RemoteUserCpu"
-    # TODO last_cpu_sys_duration = "RemoteSysCpu"
+    # TODO last_cpu_user_duration = "RemoteUserCpu"      # if a job evicts before check-point, this gets lost
+    # TODO last_cpu_sys_duration = "RemoteSysCpu"        # ...
     # total seconds job has run or was suspended, conserved over evictions [updated at job checkpoint or exit]
     # TODO all_wall_duration = "RemoteWallClockTime"
     # total seconds job has ever spent in suspension, conserved over evictions [updated at job checkpoint or exit]
     # TODO all_suspension_duration = "CumulativeSuspensionTime"
     # total seconds job has run or was suspended, reset at eviction [updated at job checkpoint or exit]
-    # TODO last_wall_duration = "CommittedTime"
+    # TODO last_wall_duration = "CommittedTime"      # ISN'T UPDATED UNTIL IN CONDOR_HISTORY (NEVER UPDATES LIVE)
     # total seconds job has been suspended, reset at eviction [updated at job checkpoint or exit]
-    # TODO last_suspended_duration = "CommittedSuspensionTime"
+    # TODO last_suspended_duration = "CommittedSuspensionTime"         # (NEVER UPDATES LIVE)
     # number of times the job has been started (not defined for standard universe) and suspended
     # TODO num_run_starts = "NumJobStarts"
     # TODO num_suspensions = "TotalSuspensions"  # conserved over evictions
@@ -94,6 +114,9 @@ class Ad(object):
     # site at which the job was submitted and ran (last), the latter requiring correction sometimes
     submit_site = "SUBMIT_SITE"
     job_site = "MATCH_EXP_JOB_Site"
+
+    # batch system uses this to replace the job site MockAd field
+    last_remote_host = "LastRemoteHost"
 
     # current time
     server_time = "ServerTime"
@@ -216,7 +239,7 @@ class NetworkManager(object):
         """reformat a measurement name to abide by influx's requirements (escaping chars) and append tags"""
         # add suffix
         if tags:
-            mes += ', tagged by ' + ', '.join(tags)
+            mes += ' (' + ', '.join(tags) + ')'
 
         # escape illegal chars
         for char in NetworkManager.MES_ESCAPE_CHARS:
@@ -326,7 +349,7 @@ class Cache(object):
         for job in jobs:
 
             # only active jobs which have ever run are to be cached (to ever be looked at again)
-            if job.is_active() and job.num_run_starts > 0:
+            if job.is_active() and (Ad.last_run_start_time in job.ad):
                 jobvals = {}
                 for field in fields:
                     jobvals[field] = job.get_running_value_at(field, t)
@@ -372,6 +395,13 @@ class Cache(object):
 
 class Bin(object):
     """stores, groups and calculates a metric's values for a specific time bin"""
+
+    __slots__ = ('start_time',
+                 'end_time',
+                 'sum_vals',
+                 'job_average_vals',
+                 'time_average_vals',
+                 'division_of_sums_vals')
 
     def __init__(self, t0, t1):
         self.start_time = t0
@@ -488,7 +518,7 @@ class Job(object):
 
     #TODO: check these
     # optimises space use of many Job instances
-    __slots__ = ('ad', 'cache',
+    __slots__ = ('ad', 'cache', 'config',
 
                  'id',
                  'status',
@@ -503,10 +533,11 @@ class Job(object):
                  'last_evict_time',
                  'completion_date')
 
-    def __init__(self, ad, cache):
-        """requires the job's condor classad, and a handle to the global job cache"""
+    def __init__(self, ad, cache, config):
+        """requires the job's condor classad, and handles to the global job cache and the config"""
         self.ad = ad
         self.cache = cache
+        self.config = config
 
         self.id = ad[Ad.id]
         self.status = ad[Ad.status]
@@ -547,8 +578,35 @@ class Job(object):
                                    "that substitute fields (like submit site) are also collected.")
 
     def get_values(self, fields):
-        """returns a dict of field name to the job's current value for all the passed fields"""
-        return dict([(field, job.ad[field]) for field in fields])
+        """
+        returns a dict of field name to the job's current value for all the passed fields.
+        fields can be condor classad fields (which MUST be in the job's ad) or a MockAd
+        """
+        values = {}
+        for field in fields:
+
+            # batch system uses last remote host
+            if field == MockAd.batch_job_site:
+                host = job.ad[Ad.last_remote_host].split('@')[1]
+
+                # host is ugly though, so replace it if it's renamed in the config
+                if host in config.node_renames:
+                    values[field] = config.node_renames[host]
+                else:
+                    values[field] = host
+
+            # just a regular classad field
+            elif field in job.ad:
+                values[field] = job.ad[field]
+
+            # this should never be called for a field not present
+            else:
+                raise RuntimeError("Job.get_values was called which contained a field which wasn't a MockAd " +
+                                   "and wasn't in the job's classad! This probably means the user specified an " +
+                                   "incorrect or mispelled condor classad field in their tags for a metric.\n" +
+                                   "field: %s, classad:\n%s" % (field, json.dumps(dict(self.ad), indent=4)))
+
+        return values
 
     def is_idle(self):
         """returns whether the job is currently in the idle state"""
@@ -832,6 +890,11 @@ class Config(object):
     JSON_FIELD_JOB_CONSTRAINT = "JOB CONSTRAINT"
     JSON_VALUE_JOB_CONSTRAINT_DEFAULT = "true"
 
+    JSON_FIELD_BATCH_JOB_SITE_NAME_MAP = "NODE RENAMES"
+    JSON_VALUE_BATCH_JOB_SITE_NAME_MAP_DEFAULT = {
+        "c0-5.cms.tier3.ucdavis.edu": "UCSD"
+    }
+
     JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
     JSON_VALUE_INIT_VALUES_DEFAULT = {}
 
@@ -861,6 +924,7 @@ class Config(object):
             self.initial_values = j[Config.JSON_FIELD_INIT_VALUES]
             self.collector_address = j[Config.JSON_FIELD_COLLECTOR_ADDRESS]
             self.constraint = j[Config.JSON_FIELD_JOB_CONSTRAINT]
+            self.node_renames = j[Config.JSON_FIELD_BATCH_JOB_SITE_NAME_MAP]
 
         except IOError:
             self.bin_duration = Config.JSON_VALUE_BIN_DURATION_DEFAULT
@@ -868,12 +932,14 @@ class Config(object):
             self.initial_values = Config.JSON_VALUE_INIT_VALUES_DEFAULT
             self.collector_address = Config.JSON_VALUE_COLLECTOR_ADDRESS_LOCAL
             self.constraint = Config.JSON_VALUE_JOB_CONSTRAINT_DEFAULT
+            self.node_renames = Config.JSON_VALUE_BATCH_JOB_SITE_NAME_MAP_DEFAULT
             obj = {
                 Config.JSON_FIELD_BIN_DURATION: self.bin_duration,
                 Config.JSON_FIELD_DATABASE_URL: self.database_url,
                 Config.JSON_FIELD_INIT_VALUES: self.initial_values,
                 Config.JSON_FIELD_COLLECTOR_ADDRESS: self.collector_address,
-                Config.JSON_FIELD_JOB_CONSTRAINT: self.constraint
+                Config.JSON_FIELD_JOB_CONSTRAINT: self.constraint,
+                Config.JSON_FIELD_BATCH_JOB_SITE_NAME_MAP: self.node_renames
             }
             FileManager.write_to_file(obj, FileManager.FN_CONFIG)
 
@@ -881,7 +947,7 @@ class Config(object):
         if self.database_url == Config.JSON_VALUE_DATABASE_URL_EMPTY:
             print ("Please configure the daemon (edit %s) " % FileManager.FN_CACHE +
                    "and specify the URL at which the influx databases reside (in %s)." % Config.JSON_FIELD_DATABASE_URL +
-                    "\nExiting..." )
+                   "\nExiting...")
             exit()
 
 
@@ -900,6 +966,8 @@ class Condor(object):
         debug_print("Fetching schedds from collector")
 
         self.schedds = map(htcondor.Schedd, collector.locateAll(htcondor.DaemonTypes.Schedd))
+
+        self.config = config
         self.constraint = config.constraint
 
         # will be updated once jobs are requested (may use server_time from condor_q)
@@ -912,9 +980,13 @@ class Condor(object):
         all required fields for a job, given a list of those desired by metric specifiers
         """
 
-        # TODO: actually make the rest of the code use this
-
         required = list(Job.required_fields) + list(desired_fields)
+
+        # the batch system uses a MockAd for the job site
+        if MockAd.batch_job_site in required:
+            required.remove(MockAd.batch_job_site)
+            if Ad.last_remote_host not in required:
+                required.append(Ad.last_remote_host)
 
         # job site is 'Unknown' when it runs on the brick, requiring default to submit site
         if (Ad.job_site in desired_fields) and (Ad.submit_site not in desired_fields):
@@ -934,11 +1006,11 @@ class Condor(object):
         jobs = {}
         for schedd in self.schedds:
             for ad in schedd.query(self.constraint, required_fields):
-                job = Job(ad, cache)
+                job = Job(ad, cache, self.config)
                 jobs[job.id] = job
                 self.current_time = job.server_time
             for ad in schedd.history(history_constraint, required_fields, 10000):
-                job = Job(ad, cache)
+                job = Job(ad, cache, self.config)
                 jobs[job.id] = job
 
         return [jobs[id] for id in jobs]
@@ -996,7 +1068,11 @@ condor = Condor(config)
 outbox = Outbox(config)
 
 # TODO: you need to know the classad fields desired by metrics before you collect the jobs
-desired_fields = [Ad.submit_site, "Owner", "SUBMIT_SITE", "MATCH_EXP_JOB_Site", ]
+desired_fields = ["SUBMIT_SITE",
+                  "BATCH_JOB_SITE",
+                  "RemoteUserCpu",
+                  "RemoteSysCpu",
+                  "RemoteWallClockTime"]
 
 # get jobs
 jobs = condor.get_jobs(cache, desired_fields)
@@ -1004,6 +1080,8 @@ jobs = condor.get_jobs(cache, desired_fields)
 # allocate time since previous run into bins
 bin_times = range(cache.first_bin_start_time, condor.current_time, config.bin_duration)
 if len(bin_times) < 2:
+    print ("The daemon has been run too recently at %s; no bins (duration %s) have transpired" % (
+        cache.first_bin_start_time, config.bin_duration))
     exit()
 bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
 del bin_times
@@ -1016,6 +1094,38 @@ del bin_times
 # database name on the front end
 db = "Daemon3TestDatabase"
 
+mes = "jobs running on the batch system"
+tags = ["SUBMIT_SITE", "BATCH_JOB_SITE"]
+for t in bin_start_times:
+    time_bin = Bin(t, t + config.bin_duration)
+
+    for job in jobs:
+        if job.is_running_during(time_bin.start_time, time_bin.end_time):
+            time_bin.add_to_sum(1, job.get_values(tags))
+
+    outbox.add(db, mes, time_bin.get_sum(), t)
+
+#TODO: testing a 'total' CPU efficiency
+mes = "cpu efficiency"
+for t0 in bin_start_times:
+    t1 = t0 + config.bin_duration
+    time_bin = Bin(t0, t1)
+
+    for job in jobs:
+        if job.is_running_during(t0, t1):
+            cpu = job.ad["RemoteUserCpu"] + job.ad["RemoteSysCpu"]
+            print "cpu: %s" % cpu
+            dt = job.ad["RemoteWallClockTime"]
+            print "dt: %s" % dt
+            eff = (100 * cpu / float(dt)) if (dt > 0) else 0
+            weight = job.get_time_running_in(t0, t1)
+            print "weight: %s" % weight
+            time_bin.add_to_time_average(eff, job.get_values(tags), weight)
+
+    outbox.add(db, mes, time_bin.get_time_average(), t0)
+
+
+'''
 # get the number of running jobs anywhere, tagged by owner (and submit site)
 mes = "num running at bin end"
 tags = ["SUBMIT_SITE", "Owner"]
@@ -1050,6 +1160,7 @@ for bin_start_time in bin_start_times:
         if job.is_idle_during(time_bin.start_time, time_bin.end_time):
             time_bin.add_to_sum(1, job.get_values(tags))
     outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
+'''
 
 '''
 # get the total CPU
@@ -1085,8 +1196,6 @@ outbox.push_outgoing()
 outbox.save()
 
 # cache fields
-# TODO we've disabled caching for now
-'''
-fields_to_cache = [Ad.cpu_time, Ad.wall_time]
+fields_to_cache = [] #TODO would cache cpu time, etc
 Cache.save_running_values(final_bin_end_time, jobs, fields_to_cache)
-'''
+
