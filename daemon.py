@@ -13,12 +13,6 @@ import json
 
 DEBUG_PRINT = True
 
-# TODO: for the BATCH system, should use LastRemoteHost in place of MATCH_EXP_JOB_Site,
-# but you'll need to split the string at @
-# TODO: however, this makes ugly af job site name.
-# TODO: make a DICT in the CONFIG which maps ugly domain name to the desired name (UCSD)
-# TODO: when checking, if domain is not in the name map, report it and continue
-
 # TODO: metric config parsing system (just do RAW with caching and interpolation: NO change
 # TODO: HOWEVER, first you should just write code to do a RAW one and see it successful on Grafana
 # BATCH_JOB_SITE
@@ -116,6 +110,7 @@ class Ad(object):
     job_site = "MATCH_EXP_JOB_Site"
 
     # batch system uses this to replace the job site MockAd field
+    remote_host = "RemoteHost"
     last_remote_host = "LastRemoteHost"
 
     # current time
@@ -204,7 +199,7 @@ class NetworkManager(object):
         """opens url, passing data and returns response. May throw network errors"""
         if data:
             data = data.replace('\n\n', '\n')
-        debug_print("attempting to open %s with data:\n%s" % (url, data))
+        debug_print("attempting to open %s" % url)
         if data:
             req = urllib2.Request(url, data)
         else:
@@ -260,6 +255,9 @@ class Outbox(object):
         if self.url[-1] != '/':
             self.url += '/'
 
+        self.influx_username = config.influx_username
+        self.influx_password = config.influx_password
+
         # load outbox from file (default to empty if can't read; doesn't delete outbox)
         try:
             self.outgoing = FileManager.load_file(FileManager.FN_OUTBOX)  # { db name: "body", ...}
@@ -283,19 +281,33 @@ class Outbox(object):
 
     def push_outgoing(self):
         """pushes data to the database, keeps failed pushes"""
+
+        debug_print("Checking and pushing the outbox")
+
         failed = {}
         for database in self.outgoing:
 
             # ensure database exists (if it fails, maybe pushes to this db won't fail?)
             try:
                 query = "CREATE DATABASE IF NOT EXISTS %s" % database
-                NetworkManager.http_connect(self.url + 'query?' + urllib.urlencode({'q': query}))
+                NetworkManager.http_connect(
+                        self.url + 'query?' + urllib.urlencode({'q': query,
+                                                                'u': self.influx_username,
+                                                                'p': self.influx_password}))
             except urllib2.HTTPError:
                 print "Error! Attempting to create database %s if nonexistant failed! Continuing..." % database
+            except urllib2.URLError:
+                print "Error! The URL in the config (%s in %s) is bad.\nContinuing..." % (
+                                Config.JSON_FIELD_DATABASE_URL,
+                                FileManager.FN_CONFIG)
 
             # database exists; fragment data and push each
-            args = urllib.urlencode({'db': database, 'precision': 's'})
-            lines = self.outgoing[database].split('\n')                         # TODO this is lazy inefficient fragments
+            args = urllib.urlencode(
+                    {'db': database,
+                     'precision': 's',
+                     'u': self.influx_username,
+                     'p': self.influx_password})
+            lines = self.outgoing[database].split('\n')                   # TODO this is lazy inefficient fragments
             for i in range(0, len(lines), Outbox.HTTP_LINES_MAX):
                 fragment = '\n'.join(lines[i: i + Outbox.HTTP_LINES_MAX])
 
@@ -303,8 +315,17 @@ class Outbox(object):
                 try:
                     NetworkManager.http_connect(self.url + 'write?' + args, fragment)
                 except urllib2.HTTPError as e:
-                    print "Error! Pushing some data to database %s at %s failed! Continuing..." % (database, self.url)
-
+                    print ("Error! Pushing some data to database %s at %s failed!\n" % (database, self.url) +
+                           "(%s)\nContinuing..." % e.read())
+                    if database in failed:
+                        failed[database] += '\n' + fragment
+                    else:
+                        failed[database] = fragment
+                except urllib2.URLError:
+                    print ("Error! The URL in the config (%s in %s) is bad. " % (
+                                Config.JSON_FIELD_DATABASE_URL,
+                                FileManager.FN_CONFIG) +
+                           "Continuing...")
                     if database in failed:
                         failed[database] += '\n' + fragment
                     else:
@@ -587,7 +608,15 @@ class Job(object):
 
             # batch system uses last remote host
             if field == MockAd.batch_job_site:
-                host = job.ad[Ad.last_remote_host].split('@')[1]
+
+                if Ad.last_remote_host in self.ad:
+                    host = self.ad[Ad.last_remote_host].split('@')[-1]
+                elif Ad.remote_host in self.ad:
+                    host = self.ad[Ad.remote_host].split('@')[-1]
+                else:
+                    raise RuntimeError("Job.get_values contained the batch job site mock ad, but the job ad " +
+                                       "didn't contain RemoteHost or LastRemoteHost!\n" +
+                                       "classad:\n%s" % json.dumps(dict(self.ad), indent=4))
 
                 # host is ugly though, so replace it if it's renamed in the config
                 if host in config.node_renames:
@@ -596,8 +625,8 @@ class Job(object):
                     values[field] = host
 
             # just a regular classad field
-            elif field in job.ad:
-                values[field] = job.ad[field]
+            elif field in self.ad:
+                values[field] = self.ad[field]
 
             # this should never be called for a field not present
             else:
@@ -898,6 +927,11 @@ class Config(object):
     JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
     JSON_VALUE_INIT_VALUES_DEFAULT = {}
 
+    JSON_FIELD_INFLUX_USERNAME = "INFLUX USERNAME"
+    JSON_VALUE_INFLUX_USERNAME_DEFAULT = "admin"
+    JSON_FIELD_INFLUX_PASSWORD = "INFLUX PASSWORD"
+    JSON_VALUE_INFLUX_PASSWORD_DEFAULT = "(this isn't the real password)"
+
     # TODO
     '''
     JSON_VALUE_INIT_VALUES_DEFAULT = {
@@ -905,10 +939,6 @@ class Config(object):
                 Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time]
     }
     '''
-
-    class DaemonMode(object):
-        GRID = "GRID"
-        BATCH = "BATCH"
 
     def __init__(self):
 
@@ -925,6 +955,8 @@ class Config(object):
             self.collector_address = j[Config.JSON_FIELD_COLLECTOR_ADDRESS]
             self.constraint = j[Config.JSON_FIELD_JOB_CONSTRAINT]
             self.node_renames = j[Config.JSON_FIELD_BATCH_JOB_SITE_NAME_MAP]
+            self.influx_username = j[Config.JSON_FIELD_INFLUX_USERNAME]
+            self.influx_password = j[Config.JSON_FIELD_INFLUX_PASSWORD]
 
         except IOError:
             self.bin_duration = Config.JSON_VALUE_BIN_DURATION_DEFAULT
@@ -933,22 +965,29 @@ class Config(object):
             self.collector_address = Config.JSON_VALUE_COLLECTOR_ADDRESS_LOCAL
             self.constraint = Config.JSON_VALUE_JOB_CONSTRAINT_DEFAULT
             self.node_renames = Config.JSON_VALUE_BATCH_JOB_SITE_NAME_MAP_DEFAULT
+            self.influx_username = Config.JSON_VALUE_INFLUX_USERNAME_DEFAULT
+            self.influx_password = Config.JSON_VALUE_INFLUX_PASSWORD_DEFAULT
             obj = {
                 Config.JSON_FIELD_BIN_DURATION: self.bin_duration,
                 Config.JSON_FIELD_DATABASE_URL: self.database_url,
                 Config.JSON_FIELD_INIT_VALUES: self.initial_values,
                 Config.JSON_FIELD_COLLECTOR_ADDRESS: self.collector_address,
                 Config.JSON_FIELD_JOB_CONSTRAINT: self.constraint,
-                Config.JSON_FIELD_BATCH_JOB_SITE_NAME_MAP: self.node_renames
+                Config.JSON_FIELD_BATCH_JOB_SITE_NAME_MAP: self.node_renames,
+                Config.JSON_FIELD_INFLUX_USERNAME: self.influx_username,
+                Config.JSON_FIELD_INFLUX_PASSWORD: self.influx_password
             }
             FileManager.write_to_file(obj, FileManager.FN_CONFIG)
 
         # notify and exit if daemon needs configuration
         if self.database_url == Config.JSON_VALUE_DATABASE_URL_EMPTY:
-            print ("Please configure the daemon (edit %s) " % FileManager.FN_CACHE +
+            print ("Please configure the daemon (edit %s) " % FileManager.FN_CONFIG +
                    "and specify the URL at which the influx databases reside (in %s)." % Config.JSON_FIELD_DATABASE_URL +
                    "\nExiting...")
             exit()
+        if self.influx_password == Config.JSON_VALUE_INFLUX_PASSWORD_DEFAULT:
+            print ("Please configure the daemon (edit %s) " % FileManager.FN_CONFIG +
+                   "and specify the password of the influx account for user: %s.\nExiting..." % self.influx_username)
 
 
 class Condor(object):
@@ -959,19 +998,15 @@ class Condor(object):
         if (addr == Config.JSON_VALUE_COLLECTOR_ADDRESS_LOCAL) or (addr.strip() == ""):
             debug_print("Contacting the local collector")
             collector = htcondor.Collector()
-
         else:
             debug_print("Contacting a non-local collector (%s)" % config.collector_address)
             collector = htcondor.Collector(config.collector_address)
         debug_print("Fetching schedds from collector")
 
         self.schedds = map(htcondor.Schedd, collector.locateAll(htcondor.DaemonTypes.Schedd))
-
         self.config = config
         self.constraint = config.constraint
-
-        # will be updated once jobs are requested (may use server_time from condor_q)
-        self.current_time = int(time.time())
+        self.current_time = int(time.time())  # updated once jobs are requested (may use server_time from condor_q)
 
     @staticmethod
     def _get_all_required_fields(desired_fields):
@@ -985,6 +1020,10 @@ class Condor(object):
         # the batch system uses a MockAd for the job site
         if MockAd.batch_job_site in required:
             required.remove(MockAd.batch_job_site)
+
+            # sometimes jobs have one or the other
+            if Ad.remote_host not in required:
+                required.append(Ad.remote_host)
             if Ad.last_remote_host not in required:
                 required.append(Ad.last_remote_host)
 
@@ -1005,7 +1044,7 @@ class Condor(object):
         # we want unique jobs (no double counting)
         jobs = {}
         for schedd in self.schedds:
-            for ad in schedd.query(self.constraint, required_fields):
+            for ad in schedd.xquery(self.constraint, required_fields):
                 job = Job(ad, cache, self.config)
                 jobs[job.id] = job
                 self.current_time = job.server_time
@@ -1105,6 +1144,7 @@ for t in bin_start_times:
 
     outbox.add(db, mes, time_bin.get_sum(), t)
 
+'''
 #TODO: testing a 'total' CPU efficiency
 mes = "cpu efficiency"
 for t0 in bin_start_times:
@@ -1123,7 +1163,7 @@ for t0 in bin_start_times:
             time_bin.add_to_time_average(eff, job.get_values(tags), weight)
 
     outbox.add(db, mes, time_bin.get_time_average(), t0)
-
+'''
 
 '''
 # get the number of running jobs anywhere, tagged by owner (and submit site)
