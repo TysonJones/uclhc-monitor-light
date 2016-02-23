@@ -12,14 +12,14 @@ import time
 import json
 import re
 
+# for reading plugins
+import importlib
+import inspect
+import sys
+
+
 DEBUG_PRINT = True
 
-# TODO: metric config parsing system (just do RAW with caching and interpolation: NO change
-# TODO: HOWEVER, first you should just write code to do a RAW one and see it successful on Grafana
-# BATCH_JOB_SITE
-
-# TODO: refactor to specify multiple values
-# and format the measurement as name (tags, tags)
 
 """
 PITFALLS
@@ -161,6 +161,7 @@ class FileManager(object):
     FN_CONFIG = "config.json"
     FN_CACHE = "cache.json"
     FN_OUTBOX = "outbox.json"
+    FN_METRICS = "metrics.py"
 
     @staticmethod
     def load_file(filename):
@@ -185,10 +186,16 @@ class FileManager(object):
         return data
 
     @staticmethod
-    def write_to_file(obj, filename):
+    def write_json_to_file(obj, filename):
         """JSON encodes (prettily) and writes the passed object obj to file filename, overwriting contents"""
         f = open(filename, 'w')
         json.dump(obj, f, indent=4)
+        f.close()
+
+    @staticmethod
+    def write_str_to_file(string, filename):
+        f = open(filename, 'w')
+        f.write(string)
         f.close()
 
 
@@ -339,7 +346,7 @@ class Outbox(object):
 
     def save(self):
         """save the outbox back to file"""
-        FileManager.write_to_file(self.outgoing, FileManager.FN_OUTBOX)
+        FileManager.write_json_to_file(self.outgoing, FileManager.FN_OUTBOX)
 
 
 class Cache(object):
@@ -384,7 +391,7 @@ class Cache(object):
             Cache.JSON_FIELD_BIN_TIME: t,
             Cache.JSON_FIELD_JOB_VALUES: values
         }
-        FileManager.write_to_file(obj, FileManager.FN_CACHE)
+        FileManager.write_json_to_file(obj, FileManager.FN_CACHE)
 
     def get_prev_running_value_state_and_time(self, job, field):
         """
@@ -937,7 +944,7 @@ class Config(object):
 
     JSON_FIELD_BATCH_JOB_SITE_NAME_MAP = "NODE RENAMES"
     JSON_VALUE_BATCH_JOB_SITE_NAME_MAP_DEFAULT = {
-        "cabinet.*t2\.ucsd\.edu": "UCSD",
+        "cabinet.*t2\.ucsd\.edu": "UCSDT2",
         "comet.*": "COMET"
     }
 
@@ -994,7 +1001,7 @@ class Config(object):
                 Config.JSON_FIELD_INFLUX_USERNAME: self.influx_username,
                 Config.JSON_FIELD_INFLUX_PASSWORD: self.influx_password
             }
-            FileManager.write_to_file(obj, FileManager.FN_CONFIG)
+            FileManager.write_json_to_file(obj, FileManager.FN_CONFIG)
 
         # notify and exit if daemon needs configuration
         if self.database_url == Config.JSON_VALUE_DATABASE_URL_EMPTY:
@@ -1102,10 +1109,152 @@ class Condor(object):
         return [jobs[id] for id in jobs]
 
 
+class MetricManager(object):
+
+    DEFAULT_METRICS = '''
+#!/usr/bin/env python
+
+# Author:       Tyson Jones, January 2016 (MURPA student of Prof Frank Wuerthwein, UCSD).
+#               Feel free to contact me at  tjon14@student.monash.edu
+
+# Purpose:      user specified metrics for the condorflux system
+
+
+"""
+For your reference...
+
+--------------------------------------------------------------------------------------
+mock ads (additional classad_tags)...
+
+BATCH_SUBMIT_SITE:      uses Schedd name from which job was collected
+BATCH_JOB_SITE:         uses LastRemoteHost (after first @), though is
+                        replaced by a name in Config `NODE RENAMES` if
+                        it matches a regex therein.
+--------------------------------------------------------------------------------------
+time bin attributes...
+
+start_time
+end_time
+
+time bin methods...
+
+add_to_sum(val, tags)
+add_to_job_average(val, tags)
+add_to_time_average(val, tags, duration)
+add_to_division_of_sums(num, den, tags)
+
+get_sum()
+get_job_average()
+get_time_average()
+get_division_of_sums()
+--------------------------------------------------------------------------------------
+job attributes...
+
+ad                              - the job's classad, used for grabbing condor values.
+                                  e.g. job.ad['SUBMIT_SITE']
+
+job methods...
+
+get_values(fields)              - given a list of classad fields (or mock ads),
+                                  returns {field: value} with the job's corresponding
+                                  values
+
+is_idle()                       - returns whether the job is currently idle
+is_running()
+is_removed()
+is_completed()
+is_held()
+is_transferring_output()
+is_active()
+
+was_idle()                      - returns whether the job's very previous state was idle
+was_running()
+was_held()
+was_transferring_output()
+
+get_most_recent_time_span_idle()    - returns (start, end) of the job's most recent
+                                      time being idle. If job is still idle, end=False
+get_most_recent_time_span_running() - [as above]. If job has never run, start=False
+
+is_idle_during(t0, t1)          - returns job was ever in the idle state within [t0, t1]
+is_running_during(t0, t1)
+
+get_time_idle_in(t0, t1)        - returns duration for which job is idle in [t0, t1]
+get_time_running_in(t0, t1)
+--------------------------------------------------------------------------------------
+"""
+
+class ExampleMetric:
+    """
+    An example specification of a metric. All below attributes MUST be specified (though fields may be an empty list)
+
+    attributes:
+        db               - name of the influx DB (created if doesn't exist)
+        mes              - measurement name with which to label metric in DB
+        tags             - list of classad fields (or mock ads) which will
+                           segregate values at a time for this metric, becoming
+                           tags in the influxDB measurement
+        fields           - any additional job classad fields that this metric will
+                           look at (e.g. for metric value calculation).
+                           These must be declared so that the daemon can fetch any
+                           needed classads from condor
+    """
+
+    database_name = "CustomMetricTestDatabase"
+    mes = "idle jobs"
+    tags = ["Owner", "BATCH_SUBMIT_SITE"]
+    fields = ["RemoteUserCpu"]
+
+    @staticmethod
+    def calculate_at_bin(time_bin, jobs):
+
+        # counts the number of jobs idle at any point in the time bin
+        for job in jobs:
+            if job.is_idle_during(time_bin.start_time, time_bin.end_time):
+                time_bin.add_to_sum(1, job.get_values(ExampleMetric.tags))
+        return time_bin.get_sum()
+'''
+
+    def __init__(self):
+
+        self.metrics = []
+
+        # try to load metrics from file
+        try:
+            sys.dont_write_bytecode = True
+            metrics = importlib.import_module('metrics')
+            for _, obj in inspect.getmembers(metrics):
+                if inspect.isclass(obj):
+                    self.metrics.append(obj)
+
+        # otherwise create a default metrics spec file
+        except ImportError:
+            print ("Creating file %s with default contents. " % FileManager.FN_METRICS +
+                   "Please edit this to specify custom metrics")
+            FileManager.write_str_to_file(MetricManager.DEFAULT_METRICS)
+
+    def get_all_desired_fields(self):
+        """returns a list of all desired classad fields or mockads in the user specified metrics"""
+        fields = set()
+        for metric in self.metrics:
+            for field in metric.tags:
+                fields.add(field)
+            for field in metric.fields:
+                fields.add(field)
+        return list(fields)
+
+    def process_metrics_at_time_bin(self, time_bin, jobs, outbox):
+
+        for metric in self.metrics:
+            tagged_results = metric.calculate_at_bin(time_bin, jobs)
+            outbox.add(metric.db, metric.mes, tagged_results, time_bin.start_time)
+
+
 def debug_print(msg):
     """prints msg only if the daemon is in debug mode (DEBUG_PRINT is True)"""
     if DEBUG_PRINT:
         print msg
+
 
 def prettify(object):
     """encodes an object as a string as prettily as it can"""
@@ -1114,186 +1263,38 @@ def prettify(object):
     except TypeError:
         return str(object)
 
-# load contextual files
-config = Config()
-cache = Cache(config)
-condor = Condor(config)
-outbox = Outbox(config)
 
+def main():
+    # load contextual files
+    metricmngr = MetricManager()
+    config = Config()
+    cache = Cache(config)
+    condor = Condor(config)
+    outbox = Outbox(config)
 
-# TODO: IMPORT METRICS HERE
-execfile('metrics.py')
-metrics = [metric() for metric in vars()['Metric'].__subclasses__()]
+    # get jobs
+    jobs = condor.get_jobs(cache, metricmngr.get_all_desired_fields())
 
+    # allocate time since previous run into bins
+    bin_times = range(cache.first_bin_start_time, condor.current_time, config.bin_duration)
+    if len(bin_times) < 2:
+        print ("The daemon has been run too recently at %s; no bins (duration %s) have transpired" % (
+            cache.first_bin_start_time, config.bin_duration))
+        exit()
+    bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
+    del bin_times
 
-###############################################################################
+    # for each time bin, process every metric and add results to the outbox
+    for t in bin_start_times:
+        time_bin = Bin(t, t + config.bin_duration)
+        metricmngr.process_metrics_at_time_bin(time_bin, jobs, outbox)
 
-# TODO: you need to know the classad fields desired by metrics before you collect the jobs
-desired_fields = ["BATCH_SUBMIT_SITE",
-                  "BATCH_JOB_SITE",
-                  "Owner"]
+    # push outbox to influx
+    outbox.push_outgoing()
+    outbox.save()
 
-# get jobs
-jobs = condor.get_jobs(cache, desired_fields)
+    # cache any required fields
+    fields_to_cache = [] # TODO
+    Cache.save_time_and_running_values(final_bin_end_time, jobs, fields_to_cache)
 
-# allocate time since previous run into bins
-bin_times = range(cache.first_bin_start_time, condor.current_time, config.bin_duration)
-if len(bin_times) < 2:
-    print ("The daemon has been run too recently at %s; no bins (duration %s) have transpired" % (
-        cache.first_bin_start_time, config.bin_duration))
-    exit()
-bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
-del bin_times
-
-"----------------------------------------------------------------------------------------------------------------------"
-
-#TODO: we can only get status specific info right now (no values or val changes)
-#TODO: all fields (tags) required by the below metrics are specified above in desired
-
-
-'''
-# database name on the front end
-db = "condort2"
-sys = "grid"
-
-mes = "jobs running on the %s system" % sys
-#tags = ["BATCH_SUBMIT_SITE", "BATCH_JOB_SITE"]
-
-for t in bin_start_times:
-    time_bin = Bin(t, t + config.bin_duration)
-
-    for job in jobs:
-        if job.is_running_during(time_bin.start_time, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values(tags))
-
-    outbox.add(db, mes, time_bin.get_sum(), t)
-
-mes = "jobs running on the %s system" % sys
-tags = ["BATCH_SUBMIT_SITE", "Owner"]
-for t in bin_start_times:
-    time_bin = Bin(t, t + config.bin_duration)
-
-    for job in jobs:
-        if job.is_running_during(time_bin.start_time, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values(tags))
-
-    outbox.add(db, mes, time_bin.get_sum(), t)
-
-mes = "jobs idle on the %s system" % sys
-tags = ["BATCH_SUBMIT_SITE"]
-for t in bin_start_times:
-    time_bin = Bin(t, t + config.bin_duration)
-
-    for job in jobs:
-        if job.is_idle_during(time_bin.start_time, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values(tags))
-
-    outbox.add(db, mes, time_bin.get_sum(), t)
-
-mes = "jobs idle on the %s system" % sys
-tags = ["Owner"]
-for t in bin_start_times:
-    time_bin = Bin(t, t + config.bin_duration)
-
-    for job in jobs:
-        if job.is_idle_during(time_bin.start_time, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values(tags))
-
-    outbox.add(db, mes, time_bin.get_sum(), t)
-'''
-
-'''
-#TODO: testing a 'total' CPU efficiency
-mes = "cpu efficiency"
-for t0 in bin_start_times:
-    t1 = t0 + config.bin_duration
-    time_bin = Bin(t0, t1)
-
-    for job in jobs:
-        if job.is_running_during(t0, t1):
-            cpu = job.ad["RemoteUserCpu"] + job.ad["RemoteSysCpu"]
-            print "cpu: %s" % cpu
-            dt = job.ad["RemoteWallClockTime"]
-            print "dt: %s" % dt
-            eff = (100 * cpu / float(dt)) if (dt > 0) else 0
-            weight = job.get_time_running_in(t0, t1)
-            print "weight: %s" % weight
-            time_bin.add_to_time_average(eff, job.get_values(tags), weight)
-
-    outbox.add(db, mes, time_bin.get_time_average(), t0)
-'''
-
-'''
-# get the number of running jobs anywhere, tagged by owner (and submit site)
-mes = "num running at bin end"
-tags = ["SUBMIT_SITE", "Owner"]
-debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
-for bin_start_time in bin_start_times:
-    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-    for job in jobs:
-        if job.is_running_during(time_bin.end_time - 1, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values(tags))
-    results = time_bin.get_sum()
-    outbox.add(db, mes, results, time_bin.start_time)
-
-# getting the number of running jobs at the end of the bin, tagged by submit site and job site
-mes = "num running at bin end"
-tags = ["SUBMIT_SITE", "MATCH_EXP_JOB_Site"]
-debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
-for bin_start_time in bin_start_times:
-    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-    for job in jobs:
-        if job.is_running_during(time_bin.end_time - 1, time_bin.end_time):       # condition of inclusion
-            time_bin.add_to_sum(1, job.get_values(tags))                          # method of inclusion
-    results = time_bin.get_sum()                                                  # (method of inclusion)
-    outbox.add(db, mes, results, time_bin.start_time)
-
-# get the number of idle jobs total in each bin, tagged by owner, submit site and job site
-mes = "num idle total in bin"
-tags = ["Owner", "SUBMIT_SITE"]
-debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
-for bin_start_time in bin_start_times:
-    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-    for job in jobs:
-        if job.is_idle_during(time_bin.start_time, time_bin.end_time):
-            time_bin.add_to_sum(1, job.get_values(tags))
-    outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
-'''
-
-'''
-# get the total CPU
-mes = "total cpu at bin start"
-tags = [Ad.owner, Ad.submit_site, Ad.job_site]
-debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
-for bin_start_time in bin_start_times:
-    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-    for job in jobs:
-        if job.num_run_starts > 0:
-            time_bin.add_to_sum(job.get_running_value_at(Ad.cpu_time, time_bin.start_time), job.get_values(tags))
-    outbox.add(db, mes, time_bin.get_sum(), bin_start_time)
-
-# get the CPU efficiency of jobs tagged by owner, submit site and job site
-mes = "cpu efficiency"
-tags = [Ad.owner, Ad.submit_site, Ad.job_site]
-debug_print("Processing metric: %s (tagged by %s)" % (mes, ', '.join(tags)))
-for bin_start_time in bin_start_times:
-    time_bin = Bin(bin_start_time, bin_start_time + config.bin_duration)
-    for job in jobs:
-        cpu = job.get_running_value_change_over(Ad.cpu_time, time_bin.start_time, time_bin.end_time)
-        wall = job.get_running_value_change_over(Ad.wall_time, time_bin.start_time, time_bin.end_time)
-        if wall > 0:
-            time_bin.add_to_division_of_sums(100 * cpu, wall, job.get_values(tags))
-    results = time_bin.get_division_of_sums()
-    outbox.add(db, mes, results, bin_start_time)
-'''
-
-"----------------------------------------------------------------------------------------------------------------------"
-
-# push to influx
-outbox.push_outgoing()
-outbox.save()
-
-# cache fields
-fields_to_cache = [] #TODO would cache cpu time, etc
-Cache.save_time_and_running_values(final_bin_end_time, jobs, fields_to_cache)
-
+main()
