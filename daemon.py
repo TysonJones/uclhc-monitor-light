@@ -13,7 +13,6 @@ import json
 import re
 
 # for reading plugins
-import importlib
 import inspect
 import sys
 
@@ -231,7 +230,6 @@ class NetworkManager(object):
 
         # reformat the measurement name
         mes = NetworkManager._stringify_measurement(mes, [tag for tag in data[0][1]])
-
         body = ""
         for datum in data:
             tags = ','.join(['%s=%s' % (tag, datum[1][tag]) for tag in datum[1]])
@@ -342,6 +340,7 @@ class Outbox(object):
                     else:
                         failed[database] = fragment
 
+        debug_print("%s databases were attemptedly pushed to and %s failed" % (len(self.outgoing), len(failed)))
         self.outgoing = failed
 
     def save(self):
@@ -443,6 +442,9 @@ class Bin(object):
         self.job_average_vals = {}       # {tag code: [{tag field: val, ...}, val, num jobs], ...}
         self.time_average_vals = {}      # {tag code: [{tag field: val, ...}, val, total job time], ...}
         self.division_of_sums_vals = {}  # {tag code: [{tag field: val, ...}, numerator, denominator], ...}
+
+    def copy(self):
+        return Bin(self.start_time, self.end_time)
 
     def add_to_sum(self, val, tags):
 
@@ -716,9 +718,9 @@ class Job(object):
             if self.was_running():
                 exited = self.last_run_start_time
 
-            # TODO: otherwise, we have no idea!
+            # otherwise, we have no idea!
             else:
-                exited = None
+                exited = entered + 1
 
         # error checking
         if None in [entered, exited]:
@@ -1081,7 +1083,13 @@ class Condor(object):
 
         required_fields = Condor._get_all_required_fields(desired_fields)
 
+        debug_print("The metrics desire fields...\n%s\nwhich means we ask condor for fields...\n%s" % (
+                    desired_fields,
+                    required_fields))
+
         history_constraint = "((%s) && (EnteredCurrentStatus > %s))" % (self.constraint, cache.first_bin_start_time)
+
+        debug_print("Querying schedds with constraint '%s'" % self.constraint)
 
         # we want unique jobs (no double counting)
         jobs = {}
@@ -1200,16 +1208,26 @@ class ExampleMetric:
                            needed classads from condor
     """
 
-    database_name = "CustomMetricTestDatabase"
+    db = "ExampleMetricDatabase"
     mes = "idle jobs"
-    tags = ["Owner", "BATCH_SUBMIT_SITE"]
-    fields = ["RemoteUserCpu"]
+    tags = ["Owner"]
+    fields = []
 
     @staticmethod
     def calculate_at_bin(time_bin, jobs):
 
         # counts the number of jobs idle at any point in the time bin
         for job in jobs:
+
+            # check that Jeff hasn't made any more dud Condor jobs missing vital classad fields! :-)
+            skip_job = False
+            for tag in ExampleMetric.tags:
+                if tag not in job.ad:
+                    skip_job = True
+                    break
+            if skip_job:
+                continue
+
             if job.is_idle_during(time_bin.start_time, time_bin.end_time):
                 time_bin.add_to_sum(1, job.get_values(ExampleMetric.tags))
         return time_bin.get_sum()
@@ -1222,16 +1240,20 @@ class ExampleMetric:
         # try to load metrics from file
         try:
             sys.dont_write_bytecode = True
-            metrics = importlib.import_module('metrics')
+            module_name = FileManager.FN_METRICS.split('.')[0]
+            metrics = __import__(module_name)
+
+            # grab all classes declared in the metrics file
             for _, obj in inspect.getmembers(metrics):
-                if inspect.isclass(obj):
+                if inspect.isclass(obj) and (obj.__module__ == module_name):
                     self.metrics.append(obj)
 
         # otherwise create a default metrics spec file
-        except ImportError:
+        except ImportError as e:
             print ("Creating file %s with default contents. " % FileManager.FN_METRICS +
-                   "Please edit this to specify custom metrics")
-            FileManager.write_str_to_file(MetricManager.DEFAULT_METRICS)
+                   "Please edit this to specify custom metrics. Note that the default metrics aren't loaded " +
+                   "for this daemon's execution; proceeding with no metric collection.")
+            FileManager.write_str_to_file(MetricManager.DEFAULT_METRICS, FileManager.FN_METRICS)
 
     def get_all_desired_fields(self):
         """returns a list of all desired classad fields or mockads in the user specified metrics"""
@@ -1241,13 +1263,40 @@ class ExampleMetric:
                 fields.add(field)
             for field in metric.fields:
                 fields.add(field)
+
         return list(fields)
 
-    def process_metrics_at_time_bin(self, time_bin, jobs, outbox):
+    def process_metrics(self, bin_times, bin_duration, jobs, outbox):
 
         for metric in self.metrics:
-            tagged_results = metric.calculate_at_bin(time_bin, jobs)
-            outbox.add(metric.db, metric.mes, tagged_results, time_bin.start_time)
+
+            debug_print("Processing metric: %s %s" % (metric.mes, '(' + ', '.join(metric.tags) + ')'))
+
+            # filter for only jobs which contain the fields the metric needs
+            valid_jobs = []
+            for job in jobs:
+                try:
+                    job.get_values(metric.tags)
+                    job.get_values(metric.fields)
+                    valid_jobs.append(job)
+                except RuntimeError as e:
+                    debug_print("The following job was excluded from this metric (the metric " +
+                                "needed fields %s, some of which weren't present)" % (
+                                    metric.tags + metric.fields))
+                    debug_print(prettify(job.ad))
+                    debug_print("The caught error reads:\n%s" % str(e))
+                    continue
+
+            # calculate the metric at each time bin using only filtered jobs
+            for t in bin_times:
+                time_bin = Bin(t, t + bin_duration)
+                results = metric.calculate_at_bin(time_bin, valid_jobs)
+                outbox.add(metric.db, metric.mes, results, time_bin.start_time)
+
+            debug_print("At the final bin, metric %s yielded %s" % (metric.mes, prettify(results)))
+
+    def are_no_metrics(self):
+        return not len(self.metrics)
 
 
 def debug_print(msg):
@@ -1272,6 +1321,11 @@ def main():
     condor = Condor(config)
     outbox = Outbox(config)
 
+    # let's exit early (note we're dodging caching) if there's no metrics to collect
+    if metricmngr.are_no_metrics():
+        print "There are zero specified metrics. Exiting."
+        exit()
+
     # get jobs
     jobs = condor.get_jobs(cache, metricmngr.get_all_desired_fields())
 
@@ -1284,10 +1338,8 @@ def main():
     bin_start_times, final_bin_end_time = bin_times[:-1], bin_times[-1]
     del bin_times
 
-    # for each time bin, process every metric and add results to the outbox
-    for t in bin_start_times:
-        time_bin = Bin(t, t + config.bin_duration)
-        metricmngr.process_metrics_at_time_bin(time_bin, jobs, outbox)
+    # calc every metric at every bin and add results to the outbox
+    metricmngr.process_metrics(bin_start_times, config.bin_duration, jobs, outbox)
 
     # push outbox to influx
     outbox.push_outgoing()
