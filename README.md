@@ -141,9 +141,13 @@ and hitting <kbd>Enter</kbd>
 
 > log located at `/var/log/influxdb/influxd.log`
 
+
+###<i class="icon-cog"> Setup Data Retention </i>
+
+See [here](https://docs.influxdata.com/influxdb/v0.10/)
 _____________________________________________________________________________________
 
-[Grafana](http://grafana.org/)   
+[Grafana](http://grafana.org/)
 ----------
 
 > Grafana should run on the front end, though it is not necessary that it run on the same machine as Influx
@@ -173,7 +177,7 @@ If this fails, install version 2.6.0 directly.
 sudo yum -y install  https://grafanarel.s3.amazonaws.com/builds/grafana-2.6.0-1.x86_64.rpm
 ```
 
-###<i class="icon-play">Start Grafana</i> 
+###<i class="icon-play">Start Grafana</i>
 ```
 sudo service grafana-server start
 ```
@@ -203,12 +207,12 @@ from_address = admin@condorflux.[your-domain]
 ```
 
 
-###<i class="icon-cw">Restart Grafana</i> 
+###<i class="icon-cw">Restart Grafana</i>
 ```
 sudo service grafana-server restart
 ```
 
-###<i class="icon-plus">Create a User</i> 
+###<i class="icon-plus">Create a User</i>
 
 Visit
 ```
@@ -247,7 +251,7 @@ If not, no error will be reported but no email will be sent. You can manually se
   `Password`: `correcthorsebatterystaple`
 
   and click <kbd>Test Connection</kbd>, then <kbd>Save</kbd>
-  
+
 
 - Click <kbd>Dashboards</kbd> in the side menubar, <kbd>Home</kbd> in the top left and select <kbd>+ New</kbd> in the dropdown menu to create a new dashboard.
 
@@ -255,7 +259,7 @@ If not, no error will be reported but no email will be sent. You can manually se
 
 - Under the <kbd>Metrics</kbd> tab, set the bottom-right dropdown box to `test source`, then press <kbd>+ Query</kbd>
 
-- Adjust the query to be 
+- Adjust the query to be
   ```
   FROM testmas SELECT field(value)
    ```
@@ -292,7 +296,7 @@ The daemon requires no special priveleges or location to run, though must make a
 ```
 python daemon.py
 ```
-The daemon should report a configuration error and exit, though has now created a default configuration file.
+The daemon should report a missing metrics file and a configuration error and exit, though has now created a default configuration file and metrics file.
 
 
 ###<i class="icon-wrench"> Configure the Daemon</i>
@@ -305,6 +309,8 @@ Update the follow fields
 "INFLUX PASSWORD": "correcthorsebatterystaple",
 "DATABASE URL": "http://[your-domain]:8086",
 ```
+> Note that if keeping this username and password private is important, then keep in mind they're in the URLs opened by the daemon which are printed in debug mode (`DEBUG_MODE = True`), which may be logged by the CRON job, so make the log private.
+
 You may optionally change the field `JOB CONSTRAINT` which constrains which jobs are collected from the Condor binaries, in the [Condor expression syntax](http://research.cs.wisc.edu/htcondor/manual/v7.6/4_1Condor_s_ClassAd.html). Note classad string literals must be in quotations, which must be escaped to be valid JSON. For example
 ```
 "JOB CONSTRAINT": "Owner=?=\"jdost\""
@@ -323,7 +329,24 @@ For example,
 ```
 will result in jobs with `LastRemoteHosts` of `cabinet-0-0-1.t2.ucsd.edu`, `cabinet-5-5-5.t2.ucsd.edu` and `cabinet-8-8-4.t2.ucsd.edu` all being treated as running on the same `BATCH_JOB_SITE` of `UCSD`.
 
+###<i class="icon-plus"> Add Metrics</i>
+
+Please see the proceeding section
+
 ###<i class="icon-cog"> Setup a CRON</i>
+
+For example
+```
+crontab -e
+```
+```
+*/15 * * * * ./cron.sh
+```
+where `cron.sh` reads as
+```
+cd /path/to/daemon/directory
+python daemon.py
+```
 
 
 -----------------------------------------------------
@@ -333,21 +356,118 @@ Creating Custom Metrics
 
 > Creating a custom metric involves editing the **daemon**'s auxiliary file `metrics.py` (to have the daemon collect and push the metrics to influx) and adding a **Grafana** graph (to pull metrics from influx and display them).
 
+###<i class="icon-info"> Daemon Operation </i>
+
+The daemon remembers the last time it run, and only ever considers jobs which are currently running, or started/ended since the daemon last run (this includes jobs which started then ended between daemon runs). The daemon splits the time since the previous and now into configurably sized time bins (the final bin may end before the current time, if the time since the previous run is not even divisible by the bin size), and metrics are calculated at each bin. Custom metrics specify how they're to be calculated for a time bin.
+
+The daemon wraps classads in a Job object with many convenient methods, and provides a Bin object which abstracts the tedium of separating metric calculations between tagged values. These are elaborated upon a few sections down.
+
 ###<i class="icon-plus"> Create Metric in Daemon </i>
 
-> make sure you use unique measurement name. 
+Custom metrics are specified in `metrics.py` (in the same directory as `daemon.py`) as a class (of an *arbitrary*, but requiredly *unique* class name) with attributes `db`, `mes`, `tags`, `fields` and a non-static method `calculate_at_bin(time_bin, jobs)`.
 
-> measurement name suffixed with tag list
+####db
+- The name of the influxDB in which to store this metric.
+- This can be an existing or an original (will be automatically created) database. *If this is a new database, it will need to be manually added to Grafana as a datasource later, and its exact name is required memorising.*
 
-> jobs, bin, etc methods for ur convenience
+####mes
+ - The prefix of the influxDB measurement name of this metric; this is suffixed with the metrics `tags` list comma-separated in the full measurement name.  This identifier is used when adding this metric to Grafana graphs and is discoverable there.
+ -  Different daemon instances (i.e. running on different machines) will contribute to the same metric if they share the same `mes` and `tags` (though `tags` must include something site specific, like `SUBMIT_SITE`, to ensure the daemon's don't overwrite eachother's data; see *PITFALLS*)
 
-> what this creates (e.g. new database if didn't exist, and give example of influx http body)
+####tags
+- A list of Condor classad fields by which to split the metric's aggregation, which become InfluxDB tags with the job's classad's values. That is, jobs with differing classad values (corresponding to the fields in `tags`) will be included in separate calculations of the metric.
+- *The list may also include special fields "BATCH_JOB_SITE" and "BATCH_SUBMIT_SITE" which aren't actual condor classad fields, but are transformed to correspond to the sites of where the job ran and was submitted in the BATCH system*.
+- If a job's classad doesn't include all fields in `tags` (which aren't a *"special field"*), it won't be passed to the metric / included in its calculation.
 
-> what to remember: the database name, the measurement name
+####fields
+- A list of any additional Condor classad fields the metric needs for its calculation. This must be declared so that the stripped classads passed to the metric's `calculate_at_bin` method actually contain the needed fields.
+- If a job doesn't contain the declared fields, it will be excluded from the list passed to `calculate_at_bin`.
+
+####calculate_at_bin
+- A non-static method called by the daemon to calculate the metric at a particular time bin.
+- The time bin is passed as a `Bin` object. Also passed is a list of all jobs (as `Job` objects) which contain all fields in the metric's `fields` and `tags` in the job's classad (`Job.ad`).
+  **E.g.** if `tags = ["Owner"]` and `fields = ["DiskUsage", "RemoteUserCpu"]`, then any job known by the daemon which doesn't contain all of *"Owner"*, *"DiskUsage"* and *"RemoteUserCpu"* in its classad will be excluded from the `jobs` passed to `calculate_at_bin`.
+
+_____________________________________
+For example,
+```
+class ExampleMetric:
+    db = "example metric database"
+    mes = "num running jobs"
+    tags = ["SUBMIT_SITE", "MATCH_EXP_JOB_Site"],
+    fields = []
+
+    def calculate_at_bin(self, time_bin, jobs):
+        for job in jobs:
+            if job.is_running_during(time_bin.start_time, time_bin.end_time):
+                time_bin.add_to_sum(1, job.get_values(self.tags))
+        return time_bin.get_sum()
+```
+might result in a push to influxDB *"example metric database"* for time *"12345"* with body
+```
+num\ running\ jobs,SUBMIT_SITE=UCSD,MATCH_EXP_JOB_SITE=UCI value=10 12345
+num\ running\ jobs,SUBMIT_SITE=UCI,MATCH_EXP_JOB_SITE=UCI value=2 12345
+num\ running\ jobs,SUBMIT_SITE=UCSD,MATCH_EXP_JOB_SITE=UCR value=14 12345
+num\ running\ jobs,SUBMIT_SITE=UCI,MATCH_EXP_JOB_SITE=UCR value=1 12345
+...
+```
+_______________________________
+
+For convenience, when performing the same calculation (e.g. counting idle jobs) in multiple metrics, the operation function can be specified globally and attached to a metric.
+
+For example, `metrics.py` could read
+```
+def count_idle_jobs(self, time_bin, jobs):
+    for job in jobs:
+        if job.is_idle_during(time_bin.start_time, time_bin.end_time):
+            time_bin.add_to_sum(1, job.get_values(self.tags))
+    return time_bin.get_sum()
+
+class IdlePerOwnerAndSubmitMetric:
+    db = "GlideInMetrics"
+    mes = "idle jobs"
+    tags = ["SUBMIT_SITE", "Owner"]
+    fields = []
+    calculate_at_bin = count_idle_jobs
+
+class TotalIdlePerSubmitMetric:
+    db = "GlideInMetrics"
+    mes = "idle jobs"
+    tags = ["SUBMIT_SITE"]
+    fields = []
+    calculate_at_bin = count_idle_jobs
+```
+`metrics.py` can be extended with custom functions and use external libraries, but must **not** define any classes which aren't to be interpreted as metrics.
+
+Metrics are most easily temporarily removed by "commenting" them out as a multiline string.
+```
+"""
+
+class Metric:
+...
+
+"""
+```
+
+
+
+
+### PITFALLS
+
+> Different daemon instances on different submit sites may overwrite each other's measurement data if not tagged by some unique feature, like `SUBMIT_SITE` or `Owner` (when site specific).
+> For example, a metric of the same name counting running jobs tagged by `MATCH_EXP_JOB_Site` which is running on both the *UCSD* and *UCI* submit sites will each have access only to a subset of the total job pool (jobs which were submitted from them), and each under-report how many jobs are running at a particular site. To combat this, tag by `SUBMIT_SITE` and if non-submit-site-specific data is required, aggregate in Grafana.
+
+_________________________
+When collecting information about a job's status (i.e. compiling the number of running jobs at a time), only the job's latest instance of being in that state is considered. I.e. if the daemon is stopped and the job runs, idles then runs, then when the daemon is resumed thereafter, it will only collect information about the latest run state (after the latest idle). This is due to an indeterminacy in the time span of the previous run state, due to the overwriting of condor classads.
+(using JobStartDate, JobLastStartDate and JobCurrentStartDate, some more instances can be learned but this is not worth the effort; just keep the daemon running frequently and accept that huge backward-in-time info grabbing offers limited accuracy)
+___________________________
+
 
 ###<i class="icon-plus"> Add Datasource to Grafana </i>
 
 > optional (may be used in another one)
+
+> Select Influx0.9, even though we're using 0.10
 
 
 ###<i class="icon-plus"> Add Graph to Grafana </i>
@@ -356,4 +476,49 @@ Creating Custom Metrics
 
 > select the corresponding measurement name
 
+> If stack, set to `individual`
+
+> do staircase
+
 ---------------------------------------------------------------------
+INTEGRATE THIS
+_______________________________
+
+`SELECT` `field(value)` `mean()`
+`GROUP BY` `time(15m)` `fill(0)`
+
+`time()` should contain a duration **equal to** (preferred) or **larger than** (preferably a multiple of) the **duration between daemon runs**.
+
+`fill(0)` is used to replace null values at times (there were no timestamps sent to database within the time interval) with zero. This will give dud zeroes if `time()` doesn't contains too small a duration (less than duration between daemon runs)
+
+When displaying specifically integer information (not to be interpolated) like the number of jobs running, ensure `staircase line` in `Display Styles` is ticked (interpolation should only erroneously occur if grafana's interval grouping is misaligned to the daemons bins, which is uncontrollable. I think Grafana will align if it can).
+
+_________________________________
+
+Editing / Deleting Custom Metrics
+====================
+
+Solely changing the daemon's `metrics.py` will leave old measurements in the front-end databases, the lack of re-population of which may be confused as actual data. Measurements which are no longer being updated should be removed from the databases by...
+
+> Remove from metrics.py
+
+> Remove measurements from influxDB
+> (url query)
+
+> Remove from any grafana graphs
+
+> (Optional) Delete database, datasource, dashboard
+
+
+
+____________________________________________________
+
+Daemon Object Documentation
+=========================
+
+Job
+----
+
+
+Bin
+----
