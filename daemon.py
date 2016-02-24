@@ -19,6 +19,10 @@ import sys
 
 DEBUG_PRINT = True
 
+# TODO: escape tag values for safety (e.g. spaces and commas)
+
+# TODO: merge simplified branch back to master
+
 
 """
 PITFALLS
@@ -1192,10 +1196,22 @@ get_time_running_in(t0, t1)
 --------------------------------------------------------------------------------------
 """
 
-class ExampleMetric:
-    """
-    An example specification of a metric. All below attributes MUST be specified (though fields may be an empty list)
 
+
+def count_idle_jobs(self, time_bin, jobs):
+    for job in jobs:
+        if job.is_idle_during(time_bin.start_time, time_bin.end_time):
+            time_bin.add_to_sum(1, job.get_values(self.tags))
+    return time_bin.get_sum()
+
+def count_running_jobs(self, time_bin, jobs):
+    for job in jobs:
+        if job.is_running_during(time_bin.start_time, time_bin.end_time):
+            time_bin.add_to_sum(1, job.get_values(self.tags))
+    return time_bin.get_sum()
+
+
+"""
     attributes:
         db               - name of the influx DB (created if doesn't exist)
         mes              - measurement name with which to label metric in DB
@@ -1206,31 +1222,37 @@ class ExampleMetric:
                            look at (e.g. for metric value calculation).
                            These must be declared so that the daemon can fetch any
                            needed classads from condor
-    """
+"""
 
-    db = "ExampleMetricDatabase"
-    mes = "idle jobs"
-    tags = ["Owner"]
+
+class RunningPerSitesMetric:
+    db = "GlideInMetrics"
+    mes = "running jobs"
+    tags = ["SUBMIT_SITE", "MATCH_EXP_JOB_Site"]
     fields = []
+    calculate_at_bin = count_running_jobs
 
-    @staticmethod
-    def calculate_at_bin(time_bin, jobs):
+class RunningPerOwnerAndSubmitSiteMetric:
+    db = "GlideInMetrics"
+    mes = "running jobs"
+    tags = ["SUBMIT_SITE", "Owner"]
+    fields = []
+    calculate_at_bin = count_running_jobs
 
-        # counts the number of jobs idle at any point in the time bin
-        for job in jobs:
+class IdlePerOwnerAndSubmitMetric:
+    db = "GlideInMetrics"
+    mes = "idle jobs"
+    tags = ["SUBMIT_SITE", "Owner"]
+    fields = []
+    calculate_at_bin = count_idle_jobs
 
-            # check that Jeff hasn't made any more dud Condor jobs missing vital classad fields! :-)
-            skip_job = False
-            for tag in ExampleMetric.tags:
-                if tag not in job.ad:
-                    skip_job = True
-                    break
-            if skip_job:
-                continue
+class IdlePerSubmitMetric:
+    db = "GlideInMetrics"
+    mes = "idle jobs"
+    tags = ["SUBMIT_SITE"]
+    fields = []
+    calculate_at_bin = count_idle_jobs
 
-            if job.is_idle_during(time_bin.start_time, time_bin.end_time):
-                time_bin.add_to_sum(1, job.get_values(ExampleMetric.tags))
-        return time_bin.get_sum()
 '''
 
     def __init__(self):
@@ -1268,21 +1290,22 @@ class ExampleMetric:
 
     def process_metrics(self, bin_times, bin_duration, jobs, outbox):
 
-        for metric in self.metrics:
+        for metric_class in self.metrics:
 
-            debug_print("Processing metric: %s %s" % (metric.mes, '(' + ', '.join(metric.tags) + ')'))
+            metric_inst = metric_class()
+            debug_print("Processing metric: %s %s" % (metric_inst.mes, '(' + ', '.join(metric_inst.tags) + ')'))
 
             # filter for only jobs which contain the fields the metric needs
             valid_jobs = []
             for job in jobs:
                 try:
-                    job.get_values(metric.tags)
-                    job.get_values(metric.fields)
+                    job.get_values(metric_inst.tags)
+                    job.get_values(metric_inst.fields)
                     valid_jobs.append(job)
                 except RuntimeError as e:
                     debug_print("The following job was excluded from this metric (the metric " +
                                 "needed fields %s, some of which weren't present)" % (
-                                    metric.tags + metric.fields))
+                                    metric_inst.tags + metric_inst.fields))
                     debug_print(prettify(job.ad))
                     debug_print("The caught error reads:\n%s" % str(e))
                     continue
@@ -1290,10 +1313,10 @@ class ExampleMetric:
             # calculate the metric at each time bin using only filtered jobs
             for t in bin_times:
                 time_bin = Bin(t, t + bin_duration)
-                results = metric.calculate_at_bin(time_bin, valid_jobs)
-                outbox.add(metric.db, metric.mes, results, time_bin.start_time)
+                results = metric_inst.calculate_at_bin(time_bin, valid_jobs)
+                outbox.add(metric_inst.db, metric_inst.mes, results, time_bin.start_time)
 
-            debug_print("At the final bin, metric %s yielded %s" % (metric.mes, prettify(results)))
+            debug_print("At the final bin, metric %s yielded %s" % (metric_inst.mes, prettify(results)))
 
     def are_no_metrics(self):
         return not len(self.metrics)
