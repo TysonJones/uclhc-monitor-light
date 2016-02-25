@@ -37,7 +37,7 @@ sudo service influxdb start
 ```
 Test you can access the server by visiting the admin panel at 
 ```
-http://[your-domain]:8083/
+http://[your domain]:8083/
 ```
  If unreachable, you may need to...
 
@@ -67,7 +67,7 @@ Enter the InfluxDB shell
 influx
 >
 ```
-Create a new username and password which must be supplied to query any databases through the HTTP interface. 
+Create a new username and password which must be supplied to query any databases through the HTTP interface.
 Here, we make username: **admin** with password: **correct horse battery staple**
 ```
 > CREATE USER admin WITH PASSWORD 'correcthorsebatterystaple' WITH ALL PRIVILEGES
@@ -86,7 +86,7 @@ Navigate to the `[http]` section, and adjust
 ```
 auth-enabled = true
 ```
-> The default config can be regenerated via 
+> The default config can be regenerated via
 > ```
 > influxd config > /etc/influxdb/influxdb.conf
 > ```
@@ -94,12 +94,12 @@ auth-enabled = true
 > After enabling, use of the InfluxDB shell will require authentication.
 > ```
 > influx
-> > auth admin correcthorsebatterystaple
+> > auth admin [influx password]
 > ```
 
 ###<i class="icon-cw"> Restart InfluxDB</i>
 
-``` 
+```
 sudo service influxdb restart
 ```
 
@@ -107,18 +107,18 @@ sudo service influxdb restart
 
 Create a database `testdb` through the HTTP interface, passing your credentials.
 ```
-http://[your-domain]:8086/query?q=CREATE%20DATABASE%20testdb&u=admin&p=correcthorsebatterystaple
+http://[your domain]:8086/query?q=CREATE%20DATABASE%20testdb&u=admin&p=[influx password]
 ```
-If successful, this should yield response 
+If successful, this should yield response
 ```
 {"results":[{}]}
 ```
 Let's spoof some data we can see in Grafana later.
 Open
 ```
-http://[your-domain]:8083/
+http://[your domain]:8083/
 ```
-and enter your username and password (**admin** and **correcthorsebatterystaple**).
+and enter the influx username and password (e.g. **admin** and **correcthorsebatterystaple**).
 
 Ensure you're using the <kbd>testdb</kbd> database in the top-right corner.
 Select <kbd>Write Data</kbd> and submit
@@ -189,7 +189,7 @@ nano /etc/grafana/grafana.ini
 ```
 Navigate to the `Server` section, uncomment (remove the `;`) `domain` and replace `localhost` with your domain.
 ```
-domain = [your-domain]
+domain = [your domain]
 ```
 Navigate to the `Anonymous Auth` section and set
 ```
@@ -202,8 +202,12 @@ org_role = Viewer
 Navigate to the `SMTP / Emailing` section and set
 ```
 enabled = true
-host = [your-domain]:25
-from_address = admin@condorflux.[your-domain]
+host = [your domain]:25
+from_address = admin@condorflux.[your domain]
+```
+Navigate to the `Security` section and set
+```
+admin_user = admin
 ```
 
 
@@ -212,13 +216,13 @@ from_address = admin@condorflux.[your-domain]
 sudo service grafana-server restart
 ```
 
-###<i class="icon-plus">Create a User</i>
+###<i class="icon-plus">Create the Admin User</i>
 
 Visit
 ```
-http://[your-domain]:3000
+http://[your domain]:3000
 ```
-and select <kbd>Sign up</kbd>, then enter your details (*may require email confirmation*).
+and select <kbd>Sign up</kbd>, then enter your details with username `admin` (*may require email confirmation*).
 
 ###<i class="icon-plus">Create an Organization</i>
 A Grafana organization groups users and the dashboards they can view.
@@ -233,7 +237,7 @@ A Grafana organization groups users and the dashboards they can view.
 In the side menubar, click your organization, select <kbd>Users</kbd> then <kbd> + Add or inivite </kbd>, and enter their details.
 
 > If a SMTP server is running on port  `25`, this will send an invitation email.
-If not, no error will be reported but no email will be sent. You can manually send the email by visiting <kbd>Pending Invitations</kbd>, clicking on <kbd>Details</kbd> of the invitation and copying the address (e.g. http://[your-domain]:300/invite/abcdefg) into an email you deliver yourself.
+If not, no error will be reported but no email will be sent. You can manually send the email by visiting <kbd>Pending Invitations</kbd>, clicking on <kbd>Details</kbd> of the invitation and copying the address (e.g. http://[your domain]:300/invite/abcdefg) into an email you deliver yourself.
 
 ###<i class="icon-ok"> Test Grafana</i>
 
@@ -242,13 +246,13 @@ If not, no error will be reported but no email will be sent. You can manually se
 - Enter
   `Name`:  `test source`
   `Type`: `InfluxDB 0.9.x`
-  `Url`:  `http://[your-domain]:8086`
+  `Url`:  `http://[your domain]:8086`
   `Access`: `direct`
   `Basic Auth`: `[unchecked]`
   `With Credentials`: `[unchecked]`
   `Database`: `testdb`
   `User`: `admin`
-  `Password`: `correcthorsebatterystaple`
+  `Password`: `[influx password]`
 
   and click <kbd>Test Connection</kbd>, then <kbd>Save</kbd>
 
@@ -269,7 +273,7 @@ If not, no error will be reported but no email will be sent. You can manually se
 
 > Discard your test database with the query
 > ```
-> http://[your-domain]:8086/query?q=DROP%20DATABASE%20testdb&u=admin&p=correcthorsebatterystaple
+> http://[your domain]:8086/query?q=DROP%20DATABASE%20testdb&u=admin&p=[your password]
 > ```
 
 --------------------------------------------------------------------
@@ -306,8 +310,8 @@ nano config.json
 Update the follow fields
 ```
 "INFLUX USERNAME": "admin",
-"INFLUX PASSWORD": "correcthorsebatterystaple",
-"DATABASE URL": "http://[your-domain]:8086",
+"INFLUX PASSWORD": "[influx password]",
+"DATABASE URL": "http://[your domain]:8086",
 ```
 > Note that if keeping this username and password private is important, then keep in mind they're in the URLs opened by the daemon which are printed in debug mode (`DEBUG_MODE = True`), which may be logged by the CRON job, so make the log private.
 
@@ -352,6 +356,7 @@ python daemon.py
 
 By editing the `NEXT INITIAL BIN START TIME` field in the daemon's cache (`cache.json`), one can set the daemon to look at arbitrarily old jobs (those which started or ended since that time).
 `NEXT INITIAL BIN START TIME` must be a *seconds since epoch* time-stamp and must be earlier than the current time.
+The field will be located at the very top or very bottom of `cache.json`.
 
 > Note that doing this may cause metrics to be re-calculated at times which causes conflicts in InfluxDB data. Make sure to clear all metrics from the database (or just drop the database) before looking into the past.
 
@@ -370,7 +375,7 @@ The daemon wraps classads in a Job object with many convenient methods, and prov
 
 ###<i class="icon-plus"> Create Metric in Daemon </i>
 
-Custom metrics are specified in `metrics.py` (in the same directory as `daemon.py`) as a class (of an *arbitrary*, but requiredly *unique* class name) with attributes `db`, `mes`, `tags`, `fields` and a non-static method `calculate_at_bin(time_bin, jobs)`.
+Custom metrics are specified in `metrics.py` (in the same directory as `daemon.py`) as a class (of an *arbitrary*, but requiredly *unique* class name) with attributes `db`, `mes`, `tags`, `fields`, `cache` and a non-static method `calculate_at_bin(time_bin, jobs)`.
 
 ####db
 - The name of the influxDB in which to store this metric.
@@ -388,6 +393,9 @@ Custom metrics are specified in `metrics.py` (in the same directory as `daemon.p
 ####fields
 - A list of any additional Condor classad fields the metric needs for its calculation. This must be declared so that the stripped classads passed to the metric's `calculate_at_bin` method actually contain the needed fields.
 - If a job doesn't contain the declared fields, it will be excluded from the list passed to `calculate_at_bin`.
+
+####cache
+- A list of any Condor classad fields which need to be cached between daemon executions; these are fields which changes in are sought.
 
 ####calculate_at_bin
 - A non-static method called by the daemon to calculate the metric at a particular time bin.
@@ -473,12 +481,25 @@ class Metric:
 > A metric's python class name is arbitrary and not used anywhere, though must be unique from the class names of all other metrics in `metrics.py`.
 
 
-###<i class="icon-plus"> Add Datasource to Grafana </i>
 
-> optional (may be used in another one)
+###<i class="icon-plus"> Add Data Source to Grafana </i>
 
-> Select Influx0.9, even though we're using 0.10
+If a new metric in `metrics.py` features an original database name (`db`), then the new influx database (created when the daemon next runs, though there's no need to wait) must be added to Grafana as a ***Data Source***.
 
+In Grafana (`http://[your domain]:3000`), go to <kbd>Data Sources</kbd> in the side menubar, and select <kbd>Add new</kbd> at the top of the window.
+
+Fill out (leaving all checkboxes unchecked)...
+field | value
+------|------
+Name | **A name for the datasource**. This is used only within Grafana when adding measurements to a graph.
+Type | **InfluxDB 0.9.x**  *(as of writing this, the latest InfluxDB version is v0.10 and works with Grafana 2.6.0)*
+Url | **http://[your domain]:8086** Note this is your influxDB site, which isn't necessarily where Grafana is running.
+Access | **direct**
+Database | **The database name**. This is that specified in the metric as `db`.
+User | **admin**
+Password | **[influx password]**
+
+then click <kbd>Add</kbd>.  Afterwards click <kbd>Test Connection</kbd> to verify your influx credentials.
 
 ###<i class="icon-plus"> Add Graph to Grafana </i>
 
@@ -513,7 +534,9 @@ Solely changing the daemon's `metrics.py` will leave old measurements in the fro
 > Remove from metrics.py
 
 > Remove measurements from influxDB
-> (url query)
+> ```
+> http://[your domain]:8086/query?q=DROP%20MEASUREMENT%20[measurement-name]&u=admin&p=[influx password]
+> ```
 
 > Remove from any grafana graphs
 
