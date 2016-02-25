@@ -6,23 +6,15 @@
 # Purpose:      Condorflux daemon; a condor probe for aggregating metric data into influx and grafana
 
 import htcondor
-import urllib
 import urllib2
+import inspect
+import urllib
 import time
 import json
+import sys
 import re
 
-# for reading plugins
-import inspect
-import sys
-
-
 DEBUG_PRINT = True
-
-# TODO: escape tag values for safety (e.g. spaces and commas)
-
-# TODO: merge simplified branch back to master
-
 
 """
 PITFALLS
@@ -236,7 +228,10 @@ class NetworkManager(object):
         mes = NetworkManager._stringify_measurement(mes, [tag for tag in data[0][1]])
         body = ""
         for datum in data:
-            tags = ','.join(['%s=%s' % (tag, datum[1][tag]) for tag in datum[1]])
+            tags = ','.join(['%s=%s' % (
+                NetworkManager._stringify_tag_name_or_val(tag),
+                NetworkManager._stringify_tag_name_or_val(datum[1][tag]))
+                             for tag in datum[1]])
             body += '%s,%s value=%s %s\n' % (mes, tags, datum[0], t)
 
         # cut off trailing newline
@@ -253,6 +248,13 @@ class NetworkManager(object):
         for char in NetworkManager.MES_ESCAPE_CHARS:
             mes = mes.replace(char, '\\'+char)
         return mes
+
+    @staticmethod
+    def _stringify_tag_name_or_val(string):
+        # escape illegal chars
+        for char in NetworkManager.MES_ESCAPE_CHARS:
+            string = string.replace(char, '\\'+char)
+        return string
 
 
 class Outbox(object):
@@ -1254,8 +1256,6 @@ class IdlePerSubmitMetric:
     calculate_at_bin = count_idle_jobs
 
 '''
-
-    # TODO: remove this ()
 
     def __init__(self):
 
