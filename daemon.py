@@ -1255,7 +1255,7 @@ class IdlePerSubmitMetric:
 
 '''
 
-    # TODO: remove this
+    # TODO: remove this ()
 
     def __init__(self):
 
