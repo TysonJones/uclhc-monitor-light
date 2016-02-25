@@ -16,51 +16,6 @@ import re
 
 DEBUG_PRINT = True
 
-"""
-PITFALLS
-
-- Last status checks can be before eviction times, but run information is lost from classad on eviction
-(specifically, CommitedTime, RemoteWallClockTime, etc. Check the Condor manual to see
-http://research.cs.wisc.edu/htcondor/manual/v8.4/condor-V8_4_4-Manual.pdf)
--> avoid correlating these
-
-- NumJobStarts may be completely unreliable (not used in standard universe jobs)
--> avoid
-
-- MATCH_EXP_JOB_Site will be 'Unknown' if the job runs on the brick
--> check if so and set to be SUBMIT_SITE
-
-- RemoteUserCpu updates only when the Job check-points.
-
-- CurrentTime is bugged
--> server time is used
-
-- Only jobs from Condor_q have ServerTime
--> python time substituted
-
-- RemoteWallClockTime is not updated until job stops running (suspended, terminated or completed. Dunno about evicted)
--> is updated to include current job runtime
-
-- RemoteWallClockTime includes CumulativeSuspensionTime
-
-- RemoteWallClockTime is not reset when the job is evicted and runs on a new machine (never reset for a job)
-
-- CumulativeSuspensionTime does not include time the job spent idle when evicted or first idle
-
-- NumJobStarts is not updated until running job stops (as for RemoteWallClockTime)
--> is incremented if job currently running
-
-"""
-
-
-"""
-QUESTIONS
-
-- Does suspension count as a restart (in NumJobStarts), like eviction?
-
-"""
-
-
 class MockAd(object):
     """fields which can be specified by metrics but aren't actually Condor classads; they're manipulations thereof"""
 
@@ -83,9 +38,7 @@ class Ad(object):
 
     # time the job last check pointed (had some fields upddated)
     # TODO last_update_time = "LastCkptTime"
-    # total seconds of CPU use of a job (sum them), reset at eviction [updated at job checkpoint or exit]
-    # TODO last_cpu_user_duration = "RemoteUserCpu"      # if a job evicts before check-point, this gets lost
-    # TODO last_cpu_sys_duration = "RemoteSysCpu"        # ...
+
     # total seconds job has run or was suspended, conserved over evictions [updated at job checkpoint or exit]
     # TODO all_wall_duration = "RemoteWallClockTime"
     # total seconds job has ever spent in suspension, conserved over evictions [updated at job checkpoint or exit]
@@ -100,8 +53,11 @@ class Ad(object):
     # number of cpus given to the job
     # num_cpus = "CpusProvisioned"
 
-    # not actually needed, but relevant
-    # TODO first_run_start_time = "JobStartDate"         (very first run start time)
+    # used in config's default initial values
+    first_run_start_time = "JobStartDate"        # (very first run start time)
+    remote_user_cpu_duration = "RemoteUserCpu"      # total seconds of CPU use of a job (sum them)
+    remote_sys_cpu_duration = "RemoteSysCpu"        # these are updated at job checkpoint, reset at eviction
+
     # TODO prev_run_start_time = "JobLastStartDate"      (previous - not current - run start time. May equal first)
 
     # site at which the job was submitted and ran (last), the latter requiring correction sometimes
@@ -362,7 +318,7 @@ class Cache(object):
     def __init__(self, config):
         """requires a handle to a Config instance to access a job's initial values"""
 
-        # { field: [val, state or state boundary, field of init time], ... }
+        # { field: [val, state of update, field of init time], ... }
         self.initial_values = config.initial_values
 
         # load cache from file, recreating if unable
@@ -380,7 +336,7 @@ class Cache(object):
         """
         saves the cache with fields values of active jobs among passed jobs (interpolated to t)
         from current daemon run, and writes the cache back to file. Currently only correctly handles
-        fields which change over time strictly when the job is in the running state
+        fields which change over time strictly when the job is in the running state (but will accept others blindly)
         """
         values = {}
         for job in jobs:
@@ -389,7 +345,7 @@ class Cache(object):
             if job.is_active() and (Ad.last_run_start_time in job.ad):
                 jobvals = {}
                 for field in fields:
-                    jobvals[field] = job.get_running_value_at(field, t)
+                    jobvals[field] = job.get_value_when_running_at(field, t)
                 values[job.id] = (job.status, jobvals)
 
         obj = {
@@ -401,33 +357,41 @@ class Cache(object):
     def get_prev_running_value_state_and_time(self, job, field):
         """
         get the job's field's previous value, the time of that value and the job's status at it.
-        returns (val, time, status)
+        returns (val, status, time)
         """
         # if in the cache, return info
         if (job.id in self.job_values) and (field in self.job_values[job.id][1]):
             return self.job_values[job.id][1][field], self.job_values[job.id][0], self.first_bin_start_time,
 
         # otherwise we must assume an initial value for the job
-        val, status_of_change, time_field = self.initial_values[field]
-
-        # we currently only support calculation of changes in time-changing when running fields
-        if status_of_change != Job.Status.String.RUNNING:
+        if field in self.initial_values:
+            val, status_of_change, time_field = self.initial_values[field]
+        else:
             raise RuntimeError(
-                "get_prev_value_and_time was called for a field which isn't (approx) linearly increasing when " +
-                "the job is running (this is currnetly the only type of changing field supported). Please seek " +
-                "fields which increase strictly during the time the job is running, such as cpu time and wall time"
+                "Field %s hasn't had its initial value declared in the config's (%s) '%s' field! " % (
+                    field,
+                    FileManager.FN_CONFIG,
+                    Config.JSON_FIELD_INIT_VALUES) +
+                "The field was requested for a job which wasn't yet cached, so its initial value was sought but was " +
+                "missing"
             )
 
-        # some jobs don't have all the time fields (they're too young, for example)
+        # TODO: we currently only support calculation of changes in time-changing when running fields
+        if (status_of_change != Job.Status.String.RUNNING) and (status_of_change != Job.Status.RUNNING):
+            raise RuntimeError(
+                "Illegal state of field update in config's initial job values! (Only RUNNING is supported)\n" +
+                "get_prev_value_and_time was called, asking for field %s " % field +
+                "which wasn't cached, so the fields initial value was sought from the config. The status of change " +
+                "(in what state the job must be in for the condor field to change) was declared as %s " % (
+                    status_of_change) +
+                "but currently only fields which update when the job is strictly running are supported (e.g. cpu time)."
+            )
+
+        # time_field mightn't yet be in the job's ad (the job hasn't yet entered the stage where the field is updated)
         if time_field in job.ad:
             return val, Job.Status.RUNNING, job.ad[time_field]
-
-        error_message = (
-            "get_prev_value_and_time called for a field which wasn't yet cached, so the initial " +
-            "value was used. However, the time classad field associated with the start of this " +
-            "value was not present in the job!\n" +
-            "field: %s, job: %s" % (time_field, prettify(job.ad)))
-        raise RuntimeError(error_message)
+        else:
+            return val, Job.Status.IDLE, False
 
 
 class Bin(object):
@@ -534,7 +498,7 @@ class Job(object):
         Ad.prev_status,
         Ad.server_time,
 
-        Ad.last_run_start_time,  # TODO: check we actually need all these
+        Ad.last_run_start_time,
         Ad.last_suspend_time,
         Ad.last_evict_time,
         Ad.completion_date
@@ -556,7 +520,6 @@ class Job(object):
             HELD = "HELD"
             TRANSFERRING_OUTPUT = "TRANSFERRING OUTPUT"
 
-    #TODO: check these
     # optimises space use of many Job instances
     __slots__ = ('ad', 'cache', 'config',
 
@@ -772,7 +735,7 @@ class Job(object):
             entered = self.last_run_start_time
             exited = self.entered_status_time
 
-        # otherwise the job was running and was suspended, held or evicted  # TODO: no time of being held
+        # otherwise the job was running and was suspended, held or evicted
         else:
             entered = self.last_run_start_time
 
@@ -867,73 +830,50 @@ class Job(object):
         dt = min(t1, r1) - max(t0, r0)
         return dt if dt >= 0 else 0
 
+    # TODO: this is currently ONLY for fields which update strictly during when the job is RUNNING (e.g. cpu time)
+    def get_rate_of_change_of_value_when_running(self, field):
+        """
+        consulting the cache, gets rate of change in the value of a job's classad field.
+        This is strictly for fields which update solely when the job is RUNNING
+        """
+        # find the previous known value (discard state)
+        prev_val, _, prev_time = self.cache.get_prev_running_value_state_and_time(self, field)
 
-'''
-# TODO: cache use is scary right now
-
-    def get_running_value_change_over(self, field, t0, t1):
-        """gets the change (when job's running) in a field's value over time span [t0, t1], by linear interpolation"""
-
-        # ensure that the job actually runs in the window
-        dt = self.get_time_running_in(t0, t1)
-        if dt == 0:
+        # the job might never have entered a stage where the field starts updating (so change is zero)
+        if not prev_time:
             return 0
 
-        # get the previous known value/time from the cache (may be more recent than job's initial value)
-        prev_val, prev_state, prev_time = self.cache.get_prev_running_value_state_and_time(self, field)
+        # find the total time for which the job was running since last known value
+        dt = self.get_time_running_in(prev_time, self.server_time)
 
-        # if the job wasn't RUNNING at cache time, the prev_time should be changed to when it started running again
-        if prev_state != Job.Status.RUNNING:
-            if self.is_running():
-                prev_time = self.last_run_start_time
-            else:
-                # this implies the job wasn't running at prev execution end, started running then ended before now
-                prev_time = self.prev_run_start_time
+        return (self.ad[field] - prev_val)/float(dt) if (dt > 0) else 0
 
-        # use the currently known value and find when this value was reached (end of job's run status, or now)
-        next_val = self.ad[field]
-        _, next_time = self.get_most_recent_time_span_running()
-        # if job is still running, the value corresponds to now (server time)
-        if not next_time:
-            next_time = self.server_time
-
-        # must consider for how long the job runs in the given window
-        return (next_val - prev_val)/float(next_time - prev_time) * dt
-
-    def get_running_value_at(self, field, t):
+    # TODO: this is currently ONLY for fields which update strictly during when the job is RUNNING (e.g. cpu time)
+    def get_change_in_value_when_running_over(self, field, t0, t1):
         """
-        returns a field's (strictly one that increases approx linearly only when a job is running) value at time t,
-        calculated by linear interpolation from a previous known value (or one assumed)
+        consulting the cache, gets a change in the value of a job's classad field over time [t0, t1].
+        This is strictly for fields which update solely when the job is RUNNING
         """
-        # get the previous known value/state/time from the cache (may be more recent than job's initial value)
-        prev_val, prev_state, prev_time = self.cache.get_prev_running_value_state_and_time(self, field)
+        dt = self.get_time_running_in(t0, t1)
+        rate = self.get_rate_of_change_of_value_when_running(field)
+        return rate * dt
 
-        # if the job wasn't running at its cache time, propogate to when it started
-        if prev_state != Job.Status.RUNNING:
-            if self.is_running():
-                prev_time = self.last_run_start_time
-            else:
-                # this implies the job wasn't running at prev execution end, started running then ended before now
-                prev_time = self.prev_run_start_time
+    # TODO: this is currently ONLY for fields which update strictly during when the job is RUNNING (e.g. cpu time)
+    def get_value_when_running_at(self, field, t):
+        """
+        consulting the cache, gets the value of a job's classad field at time t by linear interpolation.
+        This is strictly for fields which update solely when the job is RUNNING
+        """
+        # find the previous known value (discard state)
+        prev_val, _, prev_time = self.cache.get_prev_running_value_state_and_time(self, field)
 
-        # get the currently known value and find when this value was reached (end of job's run status, or now)
-        next_val = self.ad[field]
-        _, next_time = self.get_most_recent_time_span_running()
-        # if job is still running, the value corresponds to now (server time)
-        if not next_time:
-            next_time = self.server_time
-
-        # if t is more recent than when this field stopped updating, return its final result
-        if t >= next_time:
-            return next_val
-
-        # otherwise if t occurs before the value started updating again from prev, return the ol dval
-        if t <= prev_time:
+        # job might never have entered stage where the field starts updating (change from initial)
+        if not prev_time:
             return prev_val
 
-        # otherwise linear interpolate its value at t
-        return prev_val + (next_val - prev_val)/float(next_time - prev_time) * (t - prev_time)
-'''
+        dv = self.get_change_in_value_when_running_over(field, prev_time, t)
+        return prev_val + dv
+
 
 class Config(object):
     """loads and provides access to configurable daemon settings"""
@@ -957,20 +897,17 @@ class Config(object):
     }
 
     JSON_FIELD_INIT_VALUES = "INITIAL JOB VALUES"
-    JSON_VALUE_INIT_VALUES_DEFAULT = {}
+    JSON_VALUE_INIT_VALUES_DEFAULT = {
+        Ad.remote_user_cpu_duration: (0, Job.Status.String.RUNNING, Ad.first_run_start_time),
+        Ad.remote_sys_cpu_duration: (0, Job.Status.String.RUNNING, Ad.first_run_start_time)
+
+    }
 
     JSON_FIELD_INFLUX_USERNAME = "INFLUX USERNAME"
     JSON_VALUE_INFLUX_USERNAME_DEFAULT = "admin"
     JSON_FIELD_INFLUX_PASSWORD = "INFLUX PASSWORD"
     JSON_VALUE_INFLUX_PASSWORD_DEFAULT = "(this isn't the real password)"
 
-    # TODO
-    '''
-    JSON_VALUE_INIT_VALUES_DEFAULT = {
-                Ad.cpu_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time],
-                Ad.wall_time: [0, Job.Status.String.RUNNING, Ad.first_run_start_time]
-    }
-    '''
 
     def __init__(self):
 
@@ -1195,6 +1132,10 @@ is_running_during(t0, t1)
 
 get_time_idle_in(t0, t1)        - returns duration for which job is idle in [t0, t1]
 get_time_running_in(t0, t1)
+
+get_rate_of_change_of_value_when_running(field)
+get_change_in_value_when_running_over(field, t0, t1)
+get_value_when_running_at(field, t)
 --------------------------------------------------------------------------------------
 """
 
@@ -1224,6 +1165,13 @@ def count_running_jobs(self, time_bin, jobs):
                            look at (e.g. for metric value calculation).
                            These must be declared so that the daemon can fetch any
                            needed classads from condor
+        cache            - any job classad fields which should be cached by the daemon.
+                           caching is required when a change in a field is required,
+                           or its value at a particular (non current) time is sought
+                           (i.e. when interpolation is required)
+                           This should be a subset of fields, though the daemon will forgive
+                           you if you forgot to put any fields needed to be cache in fields
+                           (it will add them)
 """
 
 
@@ -1232,6 +1180,7 @@ class RunningPerSitesMetric:
     mes = "running jobs"
     tags = ["SUBMIT_SITE", "MATCH_EXP_JOB_Site"]
     fields = []
+    cache = []
     calculate_at_bin = count_running_jobs
 
 class RunningPerOwnerAndSubmitSiteMetric:
@@ -1239,6 +1188,7 @@ class RunningPerOwnerAndSubmitSiteMetric:
     mes = "running jobs"
     tags = ["SUBMIT_SITE", "Owner"]
     fields = []
+    cache = []
     calculate_at_bin = count_running_jobs
 
 class IdlePerOwnerAndSubmitMetric:
@@ -1246,6 +1196,7 @@ class IdlePerOwnerAndSubmitMetric:
     mes = "idle jobs"
     tags = ["SUBMIT_SITE", "Owner"]
     fields = []
+    cache = []
     calculate_at_bin = count_idle_jobs
 
 class IdlePerSubmitMetric:
@@ -1253,6 +1204,7 @@ class IdlePerSubmitMetric:
     mes = "idle jobs"
     tags = ["SUBMIT_SITE"]
     fields = []
+    cache = []
     calculate_at_bin = count_idle_jobs
 
 '''
@@ -1287,6 +1239,8 @@ class IdlePerSubmitMetric:
                 fields.add(field)
             for field in metric.fields:
                 fields.add(field)
+            for field in metric.cache:
+                fields.add(field)
 
         return list(fields)
 
@@ -1303,6 +1257,7 @@ class IdlePerSubmitMetric:
                 try:
                     job.get_values(metric_inst.tags)
                     job.get_values(metric_inst.fields)
+                    job.get_values(metric_inst.cache)
                     valid_jobs.append(job)
                 except RuntimeError as e:
                     debug_print("The following job was excluded from this metric (the metric " +
@@ -1322,6 +1277,14 @@ class IdlePerSubmitMetric:
 
     def are_no_metrics(self):
         return not len(self.metrics)
+
+    def get_fields_to_cache(self):
+        """returns a list of clasad fields to cache for each job"""
+        fields_to_cache = set()
+        for metric_class in self.metrics:
+            for field in metric_class.cache:
+                fields_to_cache.add(field)
+        return list(fields_to_cache)
 
 
 def debug_print(msg):
@@ -1371,7 +1334,6 @@ def main():
     outbox.save()
 
     # cache any required fields
-    fields_to_cache = [] # TODO
-    Cache.save_time_and_running_values(final_bin_end_time, jobs, fields_to_cache)
+    Cache.save_time_and_running_values(final_bin_end_time, jobs, metricmngr.get_fields_to_cache())
 
 main()

@@ -333,7 +333,7 @@ will result in jobs with `LastRemoteHosts` of `cabinet-0-0-1.t2.ucsd.edu`, `cabi
 
 Please see the proceeding section
 
-###<i class="icon-cog"> Setup a CRON</i>
+###<i class="icon-clock"> Setup a CRON</i>
 
 For example
 ```
@@ -344,10 +344,16 @@ crontab -e
 ```
 where `cron.sh` reads as
 ```
-cd /path/to/daemon/directory
+cd [path to daemon directory]
 python daemon.py
 ```
 
+###<i class="icon-fast-bw"> Looking Into the Past</i>
+
+By editing the `NEXT INITIAL BIN START TIME` field in the daemon's cache (`cache.json`), one can set the daemon to look at arbitrarily old jobs (those which started or ended since that time).
+`NEXT INITIAL BIN START TIME` must be a *seconds since epoch* time-stamp and must be earlier than the current time.
+
+> Note that doing this may cause metrics to be re-calculated at times which causes conflicts in InfluxDB data. Make sure to clear all metrics from the database (or just drop the database) before looking into the past.
 
 -----------------------------------------------------
 
@@ -454,13 +460,17 @@ class Metric:
 
 ### PITFALLS
 
+> #### Conflicting Metrics from Different Daemons
 > Different daemon instances on different submit sites may overwrite each other's measurement data if not tagged by some unique feature, like `SUBMIT_SITE` or `Owner` (when site specific).
 > For example, a metric of the same name counting running jobs tagged by `MATCH_EXP_JOB_Site` which is running on both the *UCSD* and *UCI* submit sites will each have access only to a subset of the total job pool (jobs which were submitted from them), and each under-report how many jobs are running at a particular site. To combat this, tag by `SUBMIT_SITE` and if non-submit-site-specific data is required, aggregate in Grafana.
 
-_________________________
-When collecting information about a job's status (i.e. compiling the number of running jobs at a time), only the job's latest instance of being in that state is considered. I.e. if the daemon is stopped and the job runs, idles then runs, then when the daemon is resumed thereafter, it will only collect information about the latest run state (after the latest idle). This is due to an indeterminacy in the time span of the previous run state, due to the overwriting of condor classads.
-(using JobStartDate, JobLastStartDate and JobCurrentStartDate, some more instances can be learned but this is not worth the effort; just keep the daemon running frequently and accept that huge backward-in-time info grabbing offers limited accuracy)
-___________________________
+> #### Only Recent Job States are Reliably Known
+> Due to limitations in the Condor classads, only a job's *most recent* session of being in a particular state (like `RUNNING` or `IDLE`) can be known by the daemon and thus any metric.
+> For example, if between consecutive executions of the daemon, a job becomes `IDLE` then `RUNNING` then `IDLE` then `RUNNING`, only the time span that the job spends in its latter idle and running stages can be retrieved.
+> This is only really relevant when the time between daemon execution's is set to be really large (such as when *looking into the past*).
+
+> #### Class Names Must Be Unique
+> A metric's python class name is arbitrary and not used anywhere, though must be unique from the class names of all other metrics in `metrics.py`.
 
 
 ###<i class="icon-plus"> Add Datasource to Grafana </i>
