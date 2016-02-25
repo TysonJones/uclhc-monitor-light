@@ -42,3 +42,21 @@ QUESTIONS
 - Does suspension count as a restart (in NumJobStarts), like eviction?
 
 """
+
+class Ad:
+    # time the job last check pointed (had some fields upddated)
+    # TODO last_update_time = "LastCkptTime"
+    # total seconds job has run or was suspended, conserved over evictions [updated at job checkpoint or exit]
+    # TODO all_wall_duration = "RemoteWallClockTime"
+    # total seconds job has ever spent in suspension, conserved over evictions [updated at job checkpoint or exit]
+    # TODO all_suspension_duration = "CumulativeSuspensionTime"
+    # total seconds job has run or was suspended, reset at eviction [updated at job checkpoint or exit]
+    # TODO last_wall_duration = "CommittedTime"      # ISN'T UPDATED UNTIL IN CONDOR_HISTORY (NEVER UPDATES LIVE)
+    # total seconds job has been suspended, reset at eviction [updated at job checkpoint or exit]
+    # TODO last_suspended_duration = "CommittedSuspensionTime"         # (NEVER UPDATES LIVE)
+    # number of times the job has been started (not defined for standard universe) and suspended
+    # TODO num_run_starts = "NumJobStarts"
+    # TODO num_suspensions = "TotalSuspensions"  # conserved over evictions
+    # number of cpus given to the job
+    # num_cpus = "CpusProvisioned"
+    pass

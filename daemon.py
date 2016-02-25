@@ -36,23 +36,6 @@ class Ad(object):
     status = "JobStatus"
     prev_status = "LastJobStatus"
 
-    # time the job last check pointed (had some fields upddated)
-    # TODO last_update_time = "LastCkptTime"
-
-    # total seconds job has run or was suspended, conserved over evictions [updated at job checkpoint or exit]
-    # TODO all_wall_duration = "RemoteWallClockTime"
-    # total seconds job has ever spent in suspension, conserved over evictions [updated at job checkpoint or exit]
-    # TODO all_suspension_duration = "CumulativeSuspensionTime"
-    # total seconds job has run or was suspended, reset at eviction [updated at job checkpoint or exit]
-    # TODO last_wall_duration = "CommittedTime"      # ISN'T UPDATED UNTIL IN CONDOR_HISTORY (NEVER UPDATES LIVE)
-    # total seconds job has been suspended, reset at eviction [updated at job checkpoint or exit]
-    # TODO last_suspended_duration = "CommittedSuspensionTime"         # (NEVER UPDATES LIVE)
-    # number of times the job has been started (not defined for standard universe) and suspended
-    # TODO num_run_starts = "NumJobStarts"
-    # TODO num_suspensions = "TotalSuspensions"  # conserved over evictions
-    # number of cpus given to the job
-    # num_cpus = "CpusProvisioned"
-
     # used in config's default initial values
     first_run_start_time = "JobStartDate"        # (very first run start time)
     remote_user_cpu_duration = "RemoteUserCpu"      # total seconds of CPU use of a job (sum them)
@@ -763,22 +746,9 @@ class Job(object):
             elif self.last_suspend_time and (self.last_suspend_time > entered):
                 exited = self.last_suspend_time
 
-            # this means the job was running, then held
+            # this means the job was running, then held (no choice but to claim it stopped instantly; we lost it!)
             else:
                 exited = entered + 1
-
-        # error checking
-        if None in [entered, exited]:
-            raise ValueError("get_most_recent_time_span_running returned a None " +
-                             "(a required classad was missing from job or " +
-                             "the combination of run times and suspend/eviction times didn't make sense)!\n" +
-                             "status: %s, prev status: %s\n" % (self.status, self.prev_status) +
-                             "last run start: %s, last evict: %s, last susp: %s, classad:\n%s" % (
-                                 self.last_run_start_time,
-                                 self.last_evict_time,
-                                 self.last_suspend_time,
-                                 prettify(self.ad)))
-
 
         return entered, exited
 
@@ -908,7 +878,6 @@ class Config(object):
     JSON_FIELD_INFLUX_PASSWORD = "INFLUX PASSWORD"
     JSON_VALUE_INFLUX_PASSWORD_DEFAULT = "(this isn't the real password)"
 
-
     def __init__(self):
 
         # initial_values give a field's initial value in a job,
@@ -978,8 +947,6 @@ class Condor(object):
             debug_print("Contacting a non-local collector (%s)" % config.collector_address)
             collector = htcondor.Collector(config.collector_address)
         debug_print("Fetching schedds from collector")
-
-        #self.schedds = map(htcondor.Schedd, collector.locateAll(htcondor.DaemonTypes.Schedd))
 
         self.schedd_ads = collector.locateAll(htcondor.DaemonTypes.Schedd)
 
@@ -1302,6 +1269,7 @@ def prettify(object):
 
 
 def main():
+
     # load contextual files
     metricmngr = MetricManager()
     config = Config()
