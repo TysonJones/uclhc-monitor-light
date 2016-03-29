@@ -16,6 +16,7 @@ import re
 
 DEBUG_PRINT = True
 
+
 class MockAd(object):
     """fields which can be specified by metrics but aren't actually Condor classads; they're manipulations thereof"""
 
@@ -139,6 +140,9 @@ class NetworkManager(object):
     # characters which must be escaped in a measurement name
     MES_ESCAPE_CHARS = [' ', ',']
 
+    # substituted for a tag's value when that value is otherwise an empty string
+    TAG_VALUE_PLACEHOLDER = "unknown"
+
     @staticmethod
     def http_connect(url, data = False):
         """opens url, passing data and returns response. May throw network errors"""
@@ -193,6 +197,12 @@ class NetworkManager(object):
         # escape illegal chars
         for char in NetworkManager.MES_ESCAPE_CHARS:
             string = string.replace(char, '\\'+char)
+
+        # monkey patch 30th March 2016
+        # if the tag value is empty, give it a placeholder
+        if not string.strip():
+            string = NetworkManager.TAG_VALUE_PLACEHOLDER
+
         return string
 
 
