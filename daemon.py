@@ -146,6 +146,9 @@ class NetworkManager(object):
     @staticmethod
     def http_connect(url, data = False):
         """opens url, passing data and returns response. May throw network errors"""
+        # TODO Changes made
+        method = "POST"
+        opener = urllib2.build_opener()
         if data:
             data = data.replace('\n\n', '\n')
         debug_print("attempting to open %s" % url)
@@ -153,7 +156,10 @@ class NetworkManager(object):
             req = urllib2.Request(url, data)
         else:
             req = urllib2.Request(url)
-        resp = urllib2.urlopen(req).read()
+        req.get_method = lambda: method
+        connection = opener.open(req)
+        resp = connection.read()
+        # resp = urllib2.urlopen(req).read()
         debug_print("successful! response: %s" % resp)
         return resp
 
@@ -185,7 +191,7 @@ class NetworkManager(object):
         """reformat a measurement name to abide by influx's requirements (escaping chars) and append tags"""
         # add suffix
         if tags:
-            mes += ' (' + ', '.join(tags) + ')'
+            mes += '_' + '_'.join(tags)
 
         # escape illegal chars
         for char in NetworkManager.MES_ESCAPE_CHARS:
@@ -253,7 +259,8 @@ class Outbox(object):
 
             # ensure database exists (if it fails, maybe pushes to this db won't fail?)
             try:
-                query = "CREATE DATABASE IF NOT EXISTS %s" % database
+                query = "CREATE DATABASE %s" % database
+		# TODO fix deprecated use of static database access, change to post request
                 NetworkManager.http_connect(
                         self.url + 'query?' + urllib.urlencode({'q': query,
                                                                 'u': self.influx_username,
@@ -1047,7 +1054,6 @@ class MetricManager(object):
 
 # Purpose:      user specified metrics for the condorflux system
 
-
 """
 For your reference...
 
@@ -1116,8 +1122,6 @@ get_value_when_running_at(field, t)
 --------------------------------------------------------------------------------------
 """
 
-
-
 def count_idle_jobs(self, time_bin, jobs):
     for job in jobs:
         if job.is_idle_during(time_bin.start_time, time_bin.end_time):
@@ -1151,7 +1155,6 @@ def count_running_jobs(self, time_bin, jobs):
                            (it will add them)
 """
 
-
 class RunningPerSitesMetric:
     db = "GlideInMetrics"
     mes = "running jobs"
@@ -1183,7 +1186,6 @@ class IdlePerSubmitMetric:
     fields = []
     cache = []
     calculate_at_bin = count_idle_jobs
-
 '''
 
     def __init__(self):
